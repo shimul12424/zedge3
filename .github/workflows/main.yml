@@ -306,7 +306,7 @@ jobs:
 
           const firebaseDatabaseURL = "https://shimul-zedge3-default-rtdb.firebaseio.com";
           const queuePath = "wallpaperQueue";
-          const r2WorkerUrl = "https://white-flower-a665zedge-r2-gateway.shawonbarba1.workers.dev";
+          const r2WorkerUrl = "https://white-flower-a665zedge-r2-gateway.shawonbarba1.workers.dev"; // Update to your Cloudflare Worker URL
 
           if (!zedgeEmail) throw new Error("Zedge email is required");
           if (!zedgePassword) throw new Error("Zedge password is required");
@@ -359,8 +359,7 @@ jobs:
               return;
             }
             try {
-              const formattedMessage = `Hey! Shimul\n${message.replace(/,\s*Sir\b/g, ", Shimul").replace(/\bSir\b/g, "Shimul")}`;
-              const url = `https://api.callmebot.com/facebook/send.php?apikey=${encodeURIComponent(apikey)}&text=${encodeURIComponent(formattedMessage)}`;
+              const url = `https://api.callmebot.com/facebook/send.php?apikey=${encodeURIComponent(apikey)}&text=${encodeURIComponent(message)}`;
               const res = await fetch(url);
               if (!res.ok) {
                 console.log(`Facebook API response failed: HTTP ${res.status}`);
@@ -369,6 +368,20 @@ jobs:
               }
             } catch (err) {
               console.log(`Error sending Facebook notification: ${err.message}`);
+            }
+          }
+
+          function getDhakaGreeting() {
+            try {
+              const dhakaHour = parseInt(new Date().toLocaleString("en-US", { timeZone: "Asia/Dhaka", hour: "2-digit", hour12: false }), 10);
+              let greetingTime = "কেমন আছেন?";
+              if (dhakaHour >= 5 && dhakaHour < 12) greetingTime = "শুভ সকাল!";
+              else if (dhakaHour >= 12 && dhakaHour < 17) greetingTime = "শুভ দুপুর!";
+              else if (dhakaHour >= 17 && dhakaHour < 22) greetingTime = "শুভ সন্ধ্যা!";
+              else greetingTime = "শুভ রাত্রি!";
+              return `জাকির স্যার, ${greetingTime}`;
+            } catch (_) {
+              return "জাকির স্যার,";
             }
           }
 
@@ -659,14 +672,6 @@ jobs:
 
           async function safeClick(locator, label, timeout = 30000) {
             console.log(`Clicking ${label}`);
-            try {
-              if (typeof locator.page === "function") {
-                const page = locator.page();
-                await dismissConsentPopup(page);
-              }
-            } catch (err) {
-              console.log("Popup auto-dismiss failed inside safeClick:", err.message);
-            }
             await locator.waitFor({ state: "visible", timeout });
             await locator.scrollIntoViewIfNeeded();
             await locator.click();
@@ -676,27 +681,8 @@ jobs:
             let lastErr = null;
             for (let attempt = 1; attempt <= retries; attempt++) {
               try {
-                // Enhanced popup dismissal before each click attempt
-                console.log(`🔧 Pre-click popup cleanup for ${label} (attempt ${attempt}/${retries})`);
                 await dismissConsentPopup(page);
-                await page.waitForTimeout(500);
-                
-                // Check for and handle any overlay elements
-                await page.evaluate(() => {
-                  // Remove potential blocking overlays
-                  const overlays = document.querySelectorAll(
-                    '[style*="position: fixed"], [style*="position:fixed"], ' +
-                    '.modal-backdrop, .overlay, .popup-overlay, ' +
-                    '[class*="backdrop"], [class*="overlay"][style*="z-index"]'
-                  );
-                  
-                  overlays.forEach(overlay => {
-                    if (overlay && !overlay.closest('[data-hook]')) {
-                      overlay.style.display = 'none';
-                    }
-                  });
-                });
-                
+                await page.waitForTimeout(300);
                 await safeClick(locator, `${label} (attempt ${attempt}/${retries})`, timeout);
                 return;
               } catch (err) {
@@ -723,11 +709,7 @@ jobs:
                   }
                   return touched;
                 }).catch(() => {});
-                
-                if (attempt < retries) {
-                  const waitTime = Math.min(1000 * attempt, 3000); // Progressive backoff
-                  await page.waitForTimeout(waitTime);
-                }
+                await page.waitForTimeout(700);
               }
             }
             throw new Error(`Failed to click ${label} after ${retries} attempts. Last error: ${lastErr?.message || "unknown"}`);
@@ -768,105 +750,248 @@ jobs:
           }
 
           async function dismissConsentPopup(page) {
-            console.log("Checking for basic consent popups...");
-            try {
-              const clicked = await page.evaluate(() => {
-                const buttons = Array.from(document.querySelectorAll("button, [role='button'], a"));
-                for (const btn of buttons) {
-                  // Check if visible and has layout
-                  if (!btn.offsetHeight && !btn.offsetWidth) continue;
+            console.log("Checking for consent/cookie popups in all frames...");
+            let clickedAny = false;
+
+            const acceptPriority = [
+              "accept all cookies",
+              "accept all",
+              "agree to all",
+              "accept cookies",
+              "i agree",
+              "agree",
+              "allow all",
+              "allow",
+              "continue",
+              "accept & continue",
+              "got it",
+              "ok",
+              "okay",
+              "proceed",
+              "understand"
+            ];
+
+            const negativeWords = ["reject", "disagree", "decline", "optional", "deny"];
+
+            const socialOrLoginKeywords = [
+              "facebook", "google", "apple", "email", "password", 
+              "login", "log in", "signin", "sign in", "signup", "sign up", 
+              "register", "create account", "continue with", "facebook lite", "sign up"
+            ];
+
+            for (const frame of page.frames()) {
+              try {
+                const clicked = await frame.evaluate(({ acceptPriority, negativeWords, socialOrLoginKeywords }) => {
+                  const buttons = Array.from(document.querySelectorAll("button, [role='button'], a"));
                   
-                  const text = btn.innerText ? btn.innerText.trim().toLowerCase() : "";
-                  if (!text) continue;
+                  const isLoginPage = window.location.href.includes("account.zedge.net") || 
+                                       window.location.href.includes("login") || 
+                                       !!document.querySelector('input[type="email"], input[type="password"]');
 
-                  const allowedTexts = ["ok", "accept", "continue", "close", "agree", "accept all", "agree & close", "consent"];
-                  if (allowedTexts.includes(text)) {
-                    // Check if it's a generic text like "close", "ok", "continue"
-                    if (["close", "ok", "continue"].includes(text)) {
-                      // We must verify this is actually a privacy consent context.
-                      // Let's traverse up the DOM (up to 7 parent levels) to find a container
-                      let isPrivacyContext = false;
-                      let isUploadOrMetaContext = false;
-                      let parent = btn.parentElement;
-                      let depth = 0;
-                      
-                      while (parent && depth < 7) {
-                        const parentText = (parent.innerText || "").toLowerCase();
-                        
-                        // Check if the container text has privacy keywords
-                        if (parentText.includes("cookie") || 
-                            parentText.includes("privacy") || 
-                            parentText.includes("consent") || 
-                            parentText.includes("partners") || 
-                            parentText.includes("personal data") || 
-                            parentText.includes("opt-out") || 
-                            parentText.includes("data protection") || 
-                            parentText.includes("gdpr")) {
-                          isPrivacyContext = true;
-                        }
-                        
-                        // Check if it's inside an upload/edit metadata form or dialogue
-                        if (parent.querySelector('input[data-hook="form-field-files-input"]') || 
-                            parent.querySelector('input[data-hook="form-field-name-input"]') ||
-                            parent.querySelector('textarea[data-hook="form-field-description-input"]') ||
-                            parent.querySelector('input[name="lockType"]') ||
-                            parentText.includes("upload files") ||
-                            parentText.includes("edit meta") ||
-                            parentText.includes("edit details") ||
-                            parentText.includes("publish to profile") ||
-                            parentText.includes("first ownership") ||
-                            parentText.includes("content policy") ||
-                            parentText.includes("z-modal")) {
-                          isUploadOrMetaContext = true;
-                        }
-                        
-                        parent = parent.parentElement;
-                        depth++;
+                  const isConsentContainer = (el) => {
+                    let cur = el;
+                    while (cur) {
+                      const id = (cur.id || "").toLowerCase();
+                      const className = (typeof cur.className === "string" ? cur.className : "").toLowerCase();
+                      const role = (cur.getAttribute?.("role") || "").toLowerCase();
+                      if (id.includes("didomi") || className.includes("didomi") ||
+                          id.includes("consent") || className.includes("consent") ||
+                          id.includes("cookie") || className.includes("cookie") ||
+                          id.includes("privacy") || className.includes("privacy") ||
+                          id.includes("popup") || className.includes("popup") ||
+                          role === "dialog" || role === "alertdialog") {
+                        return true;
                       }
-                      
-                      if (!isPrivacyContext || isUploadOrMetaContext) {
-                        // Skip clicking this button because it's not a privacy modal or it's part of the upload flow
-                        continue;
-                      }
-                    } else {
-                      // For more specific texts like "accept all", "agree & close", "consent", we still want to make sure it's not in the upload dialog
-                      let parent = btn.parentElement;
-                      let depth = 0;
-                      let isUploadOrMetaContext = false;
-                      while (parent && depth < 7) {
-                        const parentText = (parent.innerText || "").toLowerCase();
-                        if (parent.querySelector('input[data-hook="form-field-files-input"]') || 
-                            parent.querySelector('input[data-hook="form-field-name-input"]') ||
-                            parent.querySelector('textarea[data-hook="form-field-description-input"]') ||
-                            parentText.includes("upload files") ||
-                            parentText.includes("edit meta") ||
-                            parentText.includes("publish to profile")) {
-                          isUploadOrMetaContext = true;
-                          break;
-                        }
-                        parent = parent.parentElement;
-                        depth++;
-                      }
-                      if (isUploadOrMetaContext) continue;
+                      cur = cur.parentElement;
                     }
-                    
-                    // If we passed the checks, click the button
-                    btn.click();
-                    return text; // return the text of the button we clicked
-                  }
-                }
-                return null;
-              });
+                    return false;
+                  };
 
-              if (clicked) {
-                console.log(`Clicked consent popup button: "${clicked}"`);
-                await page.waitForTimeout(500);
-                return true;
-              }
-            } catch (err) {
-              console.log("Error inside dismissConsentPopup:", err.message);
+                  const candidates = [];
+                  for (const btn of buttons) {
+                    const rect = btn.getBoundingClientRect();
+                    const isVisible = rect.width > 0 && rect.height > 0 && 
+                                      window.getComputedStyle(btn).display !== "none" && 
+                                      window.getComputedStyle(btn).visibility !== "hidden";
+                    if (!isVisible) continue;
+
+                    const text = (btn.innerText || "").trim().toLowerCase();
+                    const ariaLabel = (btn.getAttribute("aria-label") || "").trim().toLowerCase();
+                    const title = (btn.getAttribute("title") || "").trim().toLowerCase();
+                    const id = (btn.id || "").trim().toLowerCase();
+                    const className = (typeof btn.className === "string" ? btn.className : "").trim().toLowerCase();
+                    const combined = `${text} ${ariaLabel} ${title} ${id} ${className}`.trim();
+
+                    if (!combined) continue;
+
+                    if (negativeWords.some(w => combined.includes(w))) continue;
+                    if (socialOrLoginKeywords.some(w => combined.includes(w))) continue;
+                    if (isLoginPage && !isConsentContainer(btn)) continue;
+
+                    candidates.push({ btn, text, ariaLabel, title, combined });
+                  }
+
+                  for (const phrase of acceptPriority) {
+                    const match = candidates.find(c => {
+                      if (phrase === "ok" || phrase === "okay" || phrase === "agree" || phrase === "allow" || phrase === "continue") {
+                        const words = c.text.split(/\s+/);
+                        return words.includes(phrase) || c.text === phrase;
+                      }
+                      return c.text === phrase || c.ariaLabel === phrase || c.title === phrase || c.combined.includes(phrase);
+                    });
+
+                    if (match) {
+                      match.btn.click();
+                      return { clicked: true, text: match.text || match.ariaLabel || "button" };
+                    }
+                  }
+
+                  const generic = candidates.find(c =>
+                    c.combined.includes("accept") || c.combined.includes("agree")
+                  );
+                  if (generic) {
+                    generic.btn.click();
+                    return { clicked: true, text: generic.text || "generic button" };
+                  }
+
+                  return { clicked: false };
+                }, { acceptPriority, negativeWords, socialOrLoginKeywords });
+
+                if (clicked && clicked.clicked) {
+                  console.log(`✅ Clicked consent accept element: "${clicked.text}" in frame: ${frame.url()}`);
+                  clickedAny = true;
+                  await page.waitForTimeout(500);
+                }
+              } catch (_) {}
             }
-            return false;
+
+            // Fallback close/remove only if no accept click happened
+            if (!clickedAny) {
+              try {
+                const nuked = await page.evaluate(() => {
+                  let killed = 0;
+
+                  function nukeElements(root) {
+                    let k = 0;
+                    if (!root) return k;
+
+                    const selectors = [
+                      '#didomi-host',
+                      '.didomi-popup',
+                      '[id*="didomi"]',
+                      '[class*="didomi"]',
+                      'dialog',
+                      '[role="dialog"]',
+                      '[class*="consent"]',
+                      '[class*="cookie"]',
+                      '[class*="privacy"]',
+                      '[class*="modal"]',
+                      '[class*="popup"]',
+                      '[class*="dialog"]',
+                      '[class*="overlay"]',
+                      '[class*="backdrop"]',
+                      '[class*="banner"]',
+                      '[class*="notification"]',
+                      '[class*="alert"]',
+                      '[class*="announcement"]',
+                      '[id*="consent"]',
+                      '[id*="cookie"]',
+                      '[id*="privacy"]',
+                      '[id*="modal"]',
+                      '[id*="popup"]',
+                      '[id*="dialog"]',
+                      '[id*="overlay"]',
+                      '[id*="backdrop"]',
+                      '[id*="banner"]'
+                    ];
+
+                    function isProtected(el) {
+                      if (!el) return false;
+                      if (el.querySelector("[data-hook]") || el.closest("[data-hook]")) return true;
+                      
+                      let current = el;
+                      while (current) {
+                        if (current.tagName === 'DIALOG' || 
+                            current.getAttribute('role') === 'dialog' || 
+                            current.classList.contains('sc-gKXOVf') ||
+                            current.classList.contains('dwmyJL')) {
+                          
+                          if (current.id === 'didomi-host') return false;
+                          
+                          const text = (current.innerText || current.textContent || "").toLowerCase();
+                          const uploadKeywords = [
+                            "upload",
+                            "wallpaper",
+                            "ringtone",
+                            "edit meta",
+                            "publish",
+                            "content policy",
+                            "ownership",
+                            "title",
+                            "tags",
+                            "category",
+                            "description",
+                            "success",
+                            "pending",
+                            "published"
+                          ];
+                          if (uploadKeywords.some(kw => text.includes(kw))) {
+                            return true;
+                          }
+                        }
+                        current = current.parentElement;
+                      }
+                      return false;
+                    }
+
+                    selectors.forEach(sel => {
+                      const els = root.querySelectorAll(sel);
+                      els.forEach(el => {
+                        if (!isProtected(el)) {
+                          el.remove();
+                          k++;
+                        }
+                      });
+                    });
+
+                    // Traverse shadow roots recursively
+                    const allEls = root.querySelectorAll('*');
+                    allEls.forEach(el => {
+                      if (el.shadowRoot) {
+                        k += nukeElements(el.shadowRoot);
+                      }
+                    });
+
+                    return k;
+                  }
+
+                  killed += nukeElements(document);
+
+                  const iframes = document.querySelectorAll(
+                    'iframe[src*="consent"], iframe[src*="cookie"], iframe[src*="privacy"], ' +
+                    'iframe[id*="consent"], iframe[id*="cookie"]'
+                  );
+                  iframes.forEach(iframe => {
+                    iframe.remove();
+                    killed++;
+                  });
+
+                  if (killed > 0 || document.getElementById('didomi-host')) {
+                    document.body.style.setProperty("overflow", "auto", "important");
+                    document.documentElement.style.setProperty("overflow", "auto", "important");
+                    document.body.style.setProperty("pointer-events", "auto", "important");
+                    document.documentElement.style.setProperty("pointer-events", "auto", "important");
+                  }
+                  return killed;
+                });
+                if (nuked > 0) {
+                  console.log(`✅ JS removed ${nuked} blocking elements.`);
+                  clickedAny = true;
+                }
+              } catch (_) {}
+            }
+
+            return clickedAny;
           }
 
           // Keep dismissing Zedge privacy/cookie/data-collection popups whenever they appear
@@ -1261,7 +1386,7 @@ jobs:
             // ── Chrome on Linux ────────────────────────────────────────
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-            // ── Chrome on Windows (extra) ─────────────────────────────
+            // ── Chrome on Windows (extra versions) ────────────────────
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/113.0.0.0 Safari/537.36",
@@ -1274,13 +1399,13 @@ jobs:
             "Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            // ── Edge extra ────────────────────────────────────────────
+            // ── Edge on Windows (extra versions) ──────────────────────
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36 Edg/136.0.0.0",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36 Edg/129.0.0.0",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36 Edg/128.0.0.0",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
-            // ── Chrome on macOS extra ─────────────────────────────────
+            // ── Chrome on macOS (extra versions) ──────────────────────
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
@@ -1289,36 +1414,39 @@ jobs:
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-            // ── Safari on macOS ───────────────────────────────────────
+            // ── Safari on macOS ────────────────────────────────────────
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 12_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Safari/605.1.15",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.3 Safari/605.1.15",
-            // ── Firefox extra ─────────────────────────────────────────
+            // ── Firefox on Windows (extra versions) ───────────────────
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:138.0) Gecko/20100101 Firefox/138.0",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:137.0) Gecko/20100101 Firefox/137.0",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
+            // ── Firefox on macOS ───────────────────────────────────────
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:136.0) Gecko/20100101 Firefox/136.0",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:130.0) Gecko/20100101 Firefox/130.0",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:124.0) Gecko/20100101 Firefox/124.0",
-            // ── Opera / Brave ─────────────────────────────────────────
+            // ── Opera on Windows ───────────────────────────────────────
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 OPR/118.0.0.0",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 OPR/115.0.0.0",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 OPR/110.0.0.0",
+            // ── Brave on Windows ───────────────────────────────────────
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36 Brave/135",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Brave/130",
-            // ── Android Chrome ────────────────────────────────────────
+            // ── Chrome on Android (mobile) ─────────────────────────────
             "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.6478.122 Mobile Safari/537.36",
             "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.6998.135 Mobile Safari/537.36",
             "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.6723.86 Mobile Safari/537.36",
             "Mozilla/5.0 (Linux; Android 14; SM-A546E) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.6613.127 Mobile Safari/537.36",
             "Mozilla/5.0 (Linux; Android 12; Redmi Note 11) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.82 Mobile Safari/537.36",
+            // ── Samsung Internet on Android ────────────────────────────
             "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/27.0 Chrome/130.0.0.0 Mobile Safari/537.36",
             "Mozilla/5.0 (Linux; Android 13; SM-A546B) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/25.0 Chrome/121.0.0.0 Mobile Safari/537.36",
-            // ── Linux extra ───────────────────────────────────────────
+            // ── Chrome on Linux (extra) ────────────────────────────────
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
             "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:136.0) Gecko/20100101 Firefox/136.0",
@@ -1382,7 +1510,7 @@ jobs:
               const fpUAPool = (UA_GROUPS_MAP[UA_GROUP_SEL] && UA_GROUPS_MAP[UA_GROUP_SEL].length > 0)
                 ? UA_GROUPS_MAP[UA_GROUP_SEL]
                 : FP_USER_AGENTS;
-              console.log(`🌐 UA Group: "${UA_GROUP_SEL}" → pool size: ${fpUAPool.length}`);
+              console.log(`\ud83c\udf10 UA Group: "${UA_GROUP_SEL}" → pool size: ${fpUAPool.length}`);
               const fpVP       = fpRand(FP_VIEWPORTS);
               const fpUA       = fpRand(fpUAPool);
               const fpHC       = fpRand(FP_HC);
@@ -1565,6 +1693,122 @@ jobs:
                     }
                   };
                 }
+
+                // Background Modal/Popup Observer
+                try {
+                  const observer = new MutationObserver(() => {
+                    try {
+                      const selectors = [
+                        '#didomi-host',
+                        '.didomi-popup',
+                        '[id*="didomi"]',
+                        '[class*="didomi"]',
+                        'dialog',
+                        '[role="dialog"]',
+                        '[class*="consent"]',
+                        '[class*="cookie"]',
+                        '[class*="privacy"]',
+                        '[class*="modal"]',
+                        '[class*="popup"]',
+                        '[class*="dialog"]',
+                        '[class*="overlay"]',
+                        '[class*="backdrop"]',
+                        '[class*="banner"]',
+                        '[class*="notification"]',
+                        '[class*="alert"]',
+                        '[class*="announcement"]',
+                        '[id*="consent"]',
+                        '[id*="cookie"]',
+                        '[id*="privacy"]',
+                        '[id*="modal"]',
+                        '[id*="popup"]',
+                        '[id*="dialog"]',
+                        '[id*="overlay"]',
+                        '[id*="backdrop"]',
+                        '[id*="banner"]'
+                      ];
+
+                      function isProtected(el) {
+                        if (!el) return false;
+                        if (el.querySelector("[data-hook]") || el.closest("[data-hook]")) return true;
+                        
+                        let current = el;
+                        while (current) {
+                          if (current.tagName === 'DIALOG' || 
+                              current.getAttribute('role') === 'dialog' || 
+                              current.classList.contains('sc-gKXOVf') ||
+                              current.classList.contains('dwmyJL')) {
+                            
+                            if (current.id === 'didomi-host') return false;
+                            
+                            const text = (current.innerText || current.textContent || "").toLowerCase();
+                            const uploadKeywords = [
+                              "upload",
+                              "wallpaper",
+                              "ringtone",
+                              "edit meta",
+                              "publish",
+                              "content policy",
+                              "ownership",
+                              "title",
+                              "tags",
+                              "category",
+                              "description",
+                              "success",
+                              "pending",
+                              "published"
+                            ];
+                            if (uploadKeywords.some(kw => text.includes(kw))) {
+                              return true;
+                            }
+                          }
+                          current = current.parentElement;
+                        }
+                        return false;
+                      }
+
+                      let killed = 0;
+
+                      function checkAndNuke(root) {
+                        if (!root) return;
+                        selectors.forEach(sel => {
+                          const els = root.querySelectorAll(sel);
+                          els.forEach(el => {
+                            if (!isProtected(el)) {
+                              el.remove();
+                              killed++;
+                            }
+                          });
+                        });
+
+                        // Traverse shadow DOMs recursively
+                        const allEls = root.querySelectorAll('*');
+                        allEls.forEach(el => {
+                          if (el.shadowRoot) {
+                            checkAndNuke(el.shadowRoot);
+                          }
+                        });
+                      }
+
+                      checkAndNuke(document);
+
+                      if (killed > 0 || document.getElementById('didomi-host')) {
+                        document.body.style.setProperty("overflow", "auto", "important");
+                        document.documentElement.style.setProperty("overflow", "auto", "important");
+                        document.body.style.setProperty("pointer-events", "auto", "important");
+                        document.documentElement.style.setProperty("pointer-events", "auto", "important");
+                      }
+                    } catch (_) {}
+                  });
+
+                  if (document.documentElement) {
+                    observer.observe(document.documentElement, { childList: true, subtree: true });
+                  } else {
+                    document.addEventListener("DOMContentLoaded", () => {
+                      observer.observe(document.documentElement, { childList: true, subtree: true });
+                    });
+                  }
+                } catch (_) {}
               }, {
                 hc:       fpHC,
                 dm:       fpDM,
@@ -1602,7 +1846,61 @@ jobs:
               console.log(`Page URL before login: ${page.url()}`);
               console.log(`Page title before login: ${await page.title()}`);
 
-              // Proceed with login (removed all Didomi/cookie popup handling)
+              // ── DIDOMI CONSENT POPUP HANDLER ──────────────────
+              // Handles the Didomi cookie consent modal by clicking Accept/Close button
+              // This ensures proper consent is registered with the website
+              // ──────────────────────────────────────────────────────────────
+              console.log("Checking for Didomi cookie consent modal...");
+              
+              try {
+                // Wait for Didomi modal to appear (with timeout)
+                const didomiModal = page.locator('#didomi-host');
+                await didomiModal.waitFor({ state: 'attached', timeout: 5000 }).catch(() => {});
+                const modalVisible = await didomiModal.isVisible().catch(() => false);
+                
+                if (modalVisible) {
+                  console.log("✅ Didomi consent modal detected - handling cookie consent...");
+                  
+                  // Try to click Accept/Close button
+                  const acceptButton = page.locator('#didomi-notice-agree-button');
+                  const acceptExists = await acceptButton.isVisible({ timeout: 3000 }).catch(() => false);
+                  
+                  if (acceptExists) {
+                    console.log('Clicking "Accept All Cookies" or "Close" button...');
+                    await acceptButton.click();
+                    await page.waitForTimeout(1000);
+                    console.log('✅ Successfully clicked Accept/Close button');
+                  } else {
+                    // Fallback: Try "Do not Share/Sell" button if Accept not found
+                    const learnMoreButton = page.locator('#didomi-notice-learn-more-button');
+                    const learnMoreExists = await learnMoreButton.isVisible({ timeout: 2000 }).catch(() => false);
+                    
+                    if (learnMoreExists) {
+                      console.log('Clicking "Do not Share or Sell my Personal Information" button...');
+                      await learnMoreButton.click();
+                      await page.waitForTimeout(1000);
+                      console.log('✅ Successfully clicked "Do not Share or Sell" button');
+                    } else {
+                      console.log('⚠️ No clickable Didomi buttons found - modal may require manual intervention');
+                    }
+                  }
+                  
+                  // Verify modal is gone
+                  await page.waitForTimeout(500);
+                  const stillVisible = await didomiModal.isVisible().catch(() => false);
+                  if (!stillVisible) {
+                    console.log("✅ Didomi consent modal successfully dismissed");
+                  } else {
+                    console.log("⚠️ Modal may still be visible, proceeding anyway...");
+                  }
+                } else {
+                  console.log("ℹ️ No Didomi consent modal detected (already dismissed or not present)");
+                }
+              } catch (err) {
+                console.error("⚠️ Error handling Didomi consent:", err.message);
+                console.log("Attempting to proceed with login anyway...");
+              }
+
               await safeClickWithPopupRecovery(
                 page,
                 page.locator('[data-hook="za-login-email"]').first(),
@@ -1665,15 +1963,13 @@ jobs:
                   await page.waitForLoadState("networkidle");
 
                   // Click Profiles tab
-                  await safeClickWithPopupRecovery(
-                    page,
+                  await safeClick(
                     page.locator('a:has-text("Profiles")').first(),
                     "Profiles"
                   );
 
                   // Click the correct rotated profile
-                  await safeClickWithPopupRecovery(
-                    page,
+                  await safeClick(
                     page.locator('[data-hook="profile-list"] > div').nth(currentProfileIndex),
                     `Profile Index ${currentProfileIndex}`
                   );
@@ -1739,13 +2035,15 @@ jobs:
                   successCount++;
 
                   const folderLabel = process.env.FOLDER_NAME || "Zedge Bot";
-                  const now = new Date().toLocaleString("en-US", { timeZone: "Asia/Dhaka", hour12: true, year: "numeric", month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit" });
+                  const fileTypeBn = queueItem.isMp3 ? "রিংটোন" : "ওয়ালপেপার";
+                  const fileTypeSuffix = queueItem.isMp3 ? "রিংটোনটি" : "ওয়ালপেপারটি";
+                  const greeting = getDhakaGreeting();
                   let notifyMsg = "";
                   if (publishResult.removed) {
-                    notifyMsg = `━━━━━━━━━━━━━━━━━━━━\n⚠️  J.A.R.V.I.S  ALERT\n━━━━━━━━━━━━━━━━━━━━\n📡 System   : ${folderLabel}\n🕐 Time     : ${now}\n\n🔴 ANOMALY DETECTED\n\n📁 File     : ${queueItem.name}\n🏷️  Title    : ${queueItem.title || "N/A"}\n🗂️  Category : ${queueItem.category || "N/A"}\n📊 Status   : ${publishResult.statusName}\n👤 Profile  : #${currentProfileIndex}\n🔢 Run Count: ${successCount} this session\n\n⚡ Asset auto-removed by Zedge.\nManual inspection recommended, Sir.\n━━━━━━━━━━━━━━━━━━━━`;
+                    notifyMsg = `${greeting} Zedge কিন্তু ${folderLabel} এর Profile #${currentProfileIndex} থেকে "${queueItem.name}" ${fileTypeBn}টি অটো-রিজেক্ট করে দিয়েছে। স্ট্যাটাস দেখালো: ${publishResult.statusName}। ${fileTypeSuffix} সঠিক ভাবে পাবলিশড করতেই পারলাম না.। 😢`;
                     console.log(`⚠️ Upload ${uploadNum} was removed from Zedge (Status: ${publishResult.statusName}). Counted as upload attempt. (${successCount} this run)`);
                   } else {
-                    notifyMsg = `━━━━━━━━━━━━━━━━━━━━\n🤖  J.A.R.V.I.S  REPORT\n━━━━━━━━━━━━━━━━━━━━\n📡 System   : ${folderLabel}\n🕐 Time     : ${now}\n\n✅ MISSION ACCOMPLISHED\n\n📁 File     : ${queueItem.name}\n🏷️  Title    : ${queueItem.title || "N/A"}\n🗂️  Category : ${queueItem.category || "N/A"}\n📊 Status   : ${publishResult.statusName}\n👤 Profile  : #${currentProfileIndex}\n🔢 Run Count: ${successCount} this session\n\nAll systems nominal, Sir.\n━━━━━━━━━━━━━━━━━━━━`;
+                    notifyMsg = `${greeting} আমি মাত্র ${folderLabel} এর Profile #${currentProfileIndex}-এ "${queueItem.title || queueItem.name}" ${fileTypeBn}টি আপলোড করলাম। ${fileTypeSuffix} সঠিক ভাবে পাবলিশড হয়েছে । 😊`;
                     console.log(`✅ Upload ${uploadNum} complete! Status: ${publishResult.statusName}. (${successCount} this run)`);
                   }
                   await sendFacebookNotification(notifyMsg);
@@ -1761,9 +2059,9 @@ jobs:
                   // Notify user of upload failure
                   try {
                     const errFolder = process.env.FOLDER_NAME || "Zedge Bot";
-                    const errTime = new Date().toLocaleString("en-US", { timeZone: "Asia/Dhaka", hour12: true, year: "numeric", month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit" });
+                    const fileTypeBn = queueItem?.isMp3 ? "রিংটোন" : "ওয়ালপেপার";
                     const errSnippet = String(uploadErr.message || "Unknown error").slice(0, 120);
-                    const uploadErrMsg = `━━━━━━━━━━━━━━━━━━━━\n🚨  J.A.R.V.I.S  WARNING\n━━━━━━━━━━━━━━━━━━━━\n📡 System   : ${errFolder}\n🕐 Time     : ${errTime}\n\n⚠️ UPLOAD FAILURE\n\n📁 File     : ${queueItem?.name || "N/A"}\n🏷️  Title    : ${queueItem?.title || "N/A"}\n🔢 Upload # : ${uploadNum}\n👤 Profile  : #${currentProfileIndex}\n\n🔴 Error Detail:\n${errSnippet}\n\nBot is continuing with next item.\n━━━━━━━━━━━━━━━━━━━━`;
+                    const uploadErrMsg = `${getDhakaGreeting()} ${errFolder} এর Profile #${currentProfileIndex}-এ "${queueItem?.name || "N/A"}" ${fileTypeBn}টি আপলোড করতে পারলাম না। সমস্যা: ${errSnippet}। আমি পরের ফাইলটা ট্রাই করছি।`;
                     await sendFacebookNotification(uploadErrMsg);
                   } catch (_) {}
                 }
@@ -1814,9 +2112,8 @@ jobs:
               // Notify user of fatal crash before exiting
               try {
                 const crashFolder = process.env.FOLDER_NAME || "Zedge Bot";
-                const crashTime = new Date().toLocaleString("en-US", { timeZone: "Asia/Dhaka", hour12: true, year: "numeric", month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit" });
                 const crashSnippet = String(err?.message || err || "Unknown fatal error").slice(0, 150);
-                const fatalMsg = `━━━━━━━━━━━━━━━━━━━━\n💀  J.A.R.V.I.S  CRITICAL\n━━━━━━━━━━━━━━━━━━━━\n📡 System   : ${crashFolder}\n🕐 Time     : ${crashTime}\n\n🔴 SYSTEM FAILURE\nAutomation terminated unexpectedly.\n\n🧨 Fatal Error:\n${crashSnippet}\n\n⚡ Immediate attention required.\nCheck GitHub Actions logs, Sir.\n━━━━━━━━━━━━━━━━━━━━`;
+                const fatalMsg = `${getDhakaGreeting()} কোনো একটা সমস্যার কারণে ${crashFolder} এর কাজটা পুরোপুরি বন্ধ হয়ে গিয়েছে। এরর মেসেজ: ${crashSnippet}।`;
                 await sendFacebookNotification(fatalMsg);
               } catch (_) {}
               if (context) await context.close().catch(() => {});
