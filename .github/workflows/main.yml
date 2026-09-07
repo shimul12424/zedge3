@@ -27,6 +27,10 @@ on:
         description: "Number of Zedge profiles to rotate through (e.g. 1, 2, 3, 6)"
         required: false
         default: "3"
+      force_run:
+        description: "Skip random time gate and upload immediately? true/false"
+        required: false
+        default: "false"
       os:
         description: "🖥️ Runner OS"
         required: true
@@ -51,11 +55,55 @@ on:
           - android_mobile
 
 jobs:
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      go: ${{ steps.decide.outputs.go }}
+    steps:
+      - name: Random time slot gate (daily-changing random upload time)
+        id: decide
+        shell: bash
+        run: |
+          if [ "${{ inputs.force_run }}" = "true" ]; then
+            echo "go=yes" >> "$GITHUB_OUTPUT"
+            echo "Force run enabled - skipping random gate."
+            exit 0
+          fi
+          node -e "
+            const WINDOWS = [9, 15, 21];          // window start hours (Asia/Dhaka)
+            const WINDOW_HOURS = 3;                 // each window lasts 3 hours
+            const SLOT_MIN = 30;                    // scheduler triggers every 30 min
+            const now = new Date(Date.now() + 6 * 3600 * 1000); // UTC+6 Dhaka
+            const h = now.getUTCHours(), m = now.getUTCMinutes();
+            const dateKey = now.toISOString().slice(0, 10);
+            const wIdx = WINDOWS.findIndex(ws => h >= ws && h < ws + WINDOW_HOURS);
+            if (wIdx < 0) { console.log('Outside upload windows - skip.'); process.exit(2); }
+            const slotsPerWindow = (WINDOW_HOURS * 60) / SLOT_MIN;
+            const minsIn = (h - WINDOWS[wIdx]) * 60 + m;
+            const curSlot = Math.min(slotsPerWindow - 1, Math.round(minsIn / SLOT_MIN));
+            let hash = 0;
+            const seed = dateKey + '#' + wIdx + '#ZEDGE3';
+            for (const c of seed) hash = (hash * 31 + c.charCodeAt(0)) >>> 0;
+            const chosen = hash % slotsPerWindow;
+            console.log('Date ' + dateKey + ' | window ' + wIdx + ' | chosen slot ' + chosen + ' | current slot ' + curSlot);
+            process.exit(curSlot === chosen ? 0 : 2);
+          " && echo "go=yes" >> "$GITHUB_OUTPUT" || echo "go=no" >> "$GITHUB_OUTPUT"
+
   automation:
+    needs: gate
+    if: needs.gate.outputs.go == 'yes'
     runs-on: ${{ inputs.os }}
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Random minute-level delay (human-like timing)
+        if: inputs.force_run != 'true'
+        shell: bash
+        run: |
+          DELAY=$((RANDOM % 840))
+          echo "Sleeping extra ${DELAY}s for human-like random timing..."
+          sleep $DELAY
 
       - uses: actions/setup-node@v4
         with:
@@ -352,36 +400,167 @@ jobs:
             console.log(`Deleted from Firebase: ${pathName}`);
           }
 
-          async function sendFacebookNotification(message) {
-            const apikey = "tCr8kXfDRY2FfJDa";
-            if (!apikey) {
-              console.log("Facebook notification API key not configured. Skipping.");
-              return;
-            }
+          async function sendTelegramNotification(message) {
+            const token = "8899617686:AAHHHzdNpaMTkzmkw_SSHtZGbUeEcUQjesw";
+            const chatId = "680349125";
             try {
-              const url = `https://api.callmebot.com/facebook/send.php?apikey=${encodeURIComponent(apikey)}&text=${encodeURIComponent(message)}`;
-              const res = await fetch(url);
+              const url = `https://api.telegram.org/bot${token}/sendMessage`;
+              const res = await fetch(url, {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json"
+                },
+                body: JSON.stringify({
+                  chat_id: chatId,
+                  text: message,
+                  parse_mode: "HTML"
+                })
+              });
               if (!res.ok) {
-                console.log(`Facebook API response failed: HTTP ${res.status}`);
+                const errText = await res.text().catch(() => "");
+                console.log(`Telegram API response failed: HTTP ${res.status} - ${errText}`);
               } else {
-                console.log("Facebook notification successfully sent.");
+                console.log("Telegram notification successfully sent.");
               }
             } catch (err) {
-              console.log(`Error sending Facebook notification: ${err.message}`);
+              console.log(`Error sending Telegram notification: ${err.message}`);
             }
           }
+
+          // ── Telegram helpers ─────────────────────────────────────────────────────
+          // Escape user-controlled text (titles, error messages) for parse_mode=HTML,
+          // otherwise a title containing < or & silently breaks the whole message.
+          function tgEscape(s) {
+            return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+          }
+          function fmtDhakaTime(d = new Date()) {
+            try {
+              return d.toLocaleString("en-GB", { timeZone: "Asia/Dhaka", day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit", hour12: true }).replace(",", " ·");
+            } catch (_) { return d.toISOString(); }
+          }
+          function fmtDuration(ms) {
+            const s = Math.max(0, Math.round(ms / 1000));
+            const m = Math.floor(s / 60), r = s % 60;
+            return m ? `${m} মিনিট ${r} সেকেন্ড` : `${r} সেকেন্ড`;
+          }
+          function fmtBytes(n) {
+            return n >= 1024 * 1024 ? `${(n / 1024 / 1024).toFixed(1)} MB` : `${Math.round(n / 1024)} KB`;
+          }
+
+          // Playwright ALWAYS records video as .webm (VP8). Telegram can't play that inline
+          // (it arrives as a file), so convert to H.264 MP4 before sending.
+          //   1) system ffmpeg (preinstalled on GitHub windows/ubuntu runners)
+          //   2) Playwright's bundled ffmpeg (may lack libx264 -> we fall through)
+          //   3) give up -> send the .webm as before
+          function findFfmpeg() {
+            const { execSync } = require("child_process");
+            try {
+              execSync(process.platform === "win32" ? "where ffmpeg" : "which ffmpeg", { stdio: "ignore" });
+              return "ffmpeg";
+            } catch (_) {}
+            const roots = [
+              process.env.PLAYWRIGHT_BROWSERS_PATH,
+              path.join(process.env.LOCALAPPDATA || "", "ms-playwright"),
+              path.join(process.env.HOME || process.env.USERPROFILE || "", ".cache", "ms-playwright")
+            ].filter(Boolean);
+            for (const root of roots) {
+              try {
+                for (const d of fs.readdirSync(root)) {
+                  if (!d.startsWith("ffmpeg")) continue;
+                  for (const c of ["ffmpeg-win64.exe", "ffmpeg-linux", "ffmpeg-mac"]) {
+                    const p = path.join(root, d, c);
+                    if (fs.existsSync(p)) return p;
+                  }
+                }
+              } catch (_) {}
+            }
+            return null;
+          }
+          function convertVideoToMp4(webmPath) {
+            try {
+              if (!webmPath || !fs.existsSync(webmPath)) return webmPath;
+              if (/\.mp4$/i.test(webmPath)) return webmPath;
+              const ff = findFfmpeg();
+              if (!ff) { console.log("⚠️ ffmpeg not found - sending .webm as-is"); return webmPath; }
+              const { execFileSync } = require("child_process");
+              const mp4Path = webmPath.replace(/\.webm$/i, "") + ".mp4";
+              const encode = (crf, scale) => {
+                const vf = scale ? `scale=${scale}` : "scale=trunc(iw/2)*2:trunc(ih/2)*2";
+                execFileSync(ff, ["-y", "-loglevel", "error", "-i", webmPath,
+                  "-c:v", "libx264", "-preset", "veryfast", "-crf", String(crf), "-pix_fmt", "yuv420p",
+                  "-vf", vf, "-r", "25", "-movflags", "+faststart", "-an", mp4Path],
+                  { stdio: "ignore", timeout: 10 * 60 * 1000 });
+              };
+              encode(26, null);
+              const TG_LIMIT = 49 * 1024 * 1024; // Bot API upload cap is 50 MB
+              if (fs.statSync(mp4Path).size > TG_LIMIT) {
+                console.log("📹 mp4 > 49MB - re-encoding smaller (720p, crf 32)");
+                encode(32, "-2:720");
+              }
+              console.log(`🎬 Video converted: ${path.basename(webmPath)} (${fmtBytes(fs.statSync(webmPath).size)}) -> ${path.basename(mp4Path)} (${fmtBytes(fs.statSync(mp4Path).size)})`);
+              return mp4Path;
+            } catch (e) {
+              console.log(`⚠️ Video conversion failed (${e.message}) - sending .webm as-is`);
+              return webmPath;
+            }
+          }
+
+          async function sendTelegramAttachment(filePath, type = "image", caption = "", extra = {}) {
+            const token = "8899617686:AAHHHzdNpaMTkzmkw_SSHtZGbUeEcUQjesw";
+            const chatId = "680349125";
+            try {
+              if (!fs.existsSync(filePath)) {
+                console.log(`Telegram attachment file not found: ${filePath}`);
+                return;
+              }
+              if (type === "video") filePath = convertVideoToMp4(filePath);
+              const fileBuffer = fs.readFileSync(filePath);
+              const blob = new Blob([fileBuffer]);
+              const formData = new FormData();
+              formData.append("chat_id", chatId);
+              if (caption) {
+                formData.append("caption", caption.slice(0, 1024)); // Telegram caption limit
+                formData.append("parse_mode", "HTML");
+              }
+              for (const [k, v] of Object.entries(extra || {})) formData.append(k, String(v));
+
+              let endpoint = "sendPhoto";
+              if (type === "video") {
+                endpoint = "sendVideo";
+                formData.append("supports_streaming", "true");
+                formData.append("video", blob, path.basename(filePath));
+              } else {
+                formData.append("photo", blob, path.basename(filePath));
+              }
+
+              const url = `https://api.telegram.org/bot${token}/${endpoint}`;
+              const res = await fetch(url, {
+                method: "POST",
+                body: formData
+              });
+              if (!res.ok) {
+                const errText = await res.text().catch(() => "");
+                console.log(`Telegram attachment (${type}) send failed: HTTP ${res.status} - ${errText}`);
+              } else {
+                console.log(`Telegram attachment (${type}) successfully sent.`);
+              }
+            } catch (err) {
+              console.log(`Error sending Telegram attachment (${type}): ${err.message}`);
+            }
+          }
+
 
           function getDhakaGreeting() {
             try {
               const dhakaHour = parseInt(new Date().toLocaleString("en-US", { timeZone: "Asia/Dhaka", hour: "2-digit", hour12: false }), 10);
-              let greetingTime = "কেমন আছেন?";
-              if (dhakaHour >= 5 && dhakaHour < 12) greetingTime = "শুভ সকাল!";
-              else if (dhakaHour >= 12 && dhakaHour < 17) greetingTime = "শুভ দুপুর!";
-              else if (dhakaHour >= 17 && dhakaHour < 22) greetingTime = "শুভ সন্ধ্যা!";
-              else greetingTime = "শুভ রাত্রি!";
-              return `জাকির স্যার, ${greetingTime}`;
+              let greetingTime = "শুভ দিন";
+              if (dhakaHour >= 5 && dhakaHour < 12) greetingTime = "শুভ সকাল";
+              else if (dhakaHour >= 12 && dhakaHour < 17) greetingTime = "শুভ দুপুর";
+              else if (dhakaHour >= 17 && dhakaHour < 22) greetingTime = "শুভ সন্ধ্যা";
+              else greetingTime = "শুভ রাত্রি";
+              return `হ্যালো শাওন ভাই, ${greetingTime}`;
             } catch (_) {
-              return "জাকির স্যার,";
+              return "হ্যালো শাওন ভাই";
             }
           }
 
@@ -430,10 +609,12 @@ jobs:
 
             if (state.lastUploadDate !== today) {
               console.log("New day detected! Resetting daily upload count and profile usage.");
-              // ── Alternate upload type each new day: AUDIO (ringtone) ↔ WALLPAPER (image) ──
-              const prevType = state.uploadDayType || "WALLPAPER"; // if no record yet, flip so Day 1 = AUDIO
-              state.uploadDayType = (prevType === "AUDIO") ? "WALLPAPER" : "AUDIO";
-              console.log(`📅 Day changed — today's upload type: ${state.uploadDayType} (${state.uploadDayType === "AUDIO" ? "🎵 Ringtone" : "🖼️ Wallpaper"} day)`);
+              // ── Rotate upload type each new day through all 7 content types ──
+              const TYPE_CYCLE = ["AUDIO", "WALLPAPER", "WALLPAPER_24H", "WALLPAPER_DUAL", "WALLPAPER_BATTERY", "LIVE_WALLPAPER", "CHARGING_ANIMATION"];
+              const DAY_LABELS = { AUDIO: "🎵 Ringtone", WALLPAPER: "🖼️ Wallpaper", WALLPAPER_24H: "🌅 24H Wallpaper", WALLPAPER_DUAL: "🔒 Dual Wallpaper", WALLPAPER_BATTERY: "🔋 Battery Wallpaper", LIVE_WALLPAPER: "🎬 Live Wallpaper", CHARGING_ANIMATION: "⚡ Charging Animation" };
+              const prevType = TYPE_CYCLE.includes(state.uploadDayType) ? state.uploadDayType : TYPE_CYCLE[TYPE_CYCLE.length - 1]; // if no record yet, cycle lands on AUDIO for Day 1
+              state.uploadDayType = TYPE_CYCLE[(TYPE_CYCLE.indexOf(prevType) + 1) % TYPE_CYCLE.length];
+              console.log(`📅 Day changed — today's upload type: ${state.uploadDayType} (${DAY_LABELS[state.uploadDayType]} day)`);
               state.lastUploadDate = today;
               state.totalUploadsToday = 0;
               state.profileUploadCounts = {};
@@ -490,105 +671,268 @@ jobs:
           }
           // ----------------------------------------
 
-          async function getNextWallpaperFromRealtimeDB(dayType) {
-            console.log(`Checking Firebase Realtime Database queue... (Today's type: ${dayType})`);
-            console.log(`🗄️ Active DB: ${firebaseDatabaseURL}`);
+          const SET_SLOTS = {
+            WALLPAPER_24H: ["morning", "afternoon", "evening", "night"],
+            WALLPAPER_DUAL: ["lock", "home"],
+            WALLPAPER_BATTERY: ["critical", "low", "mid", "high", "full", "charging"]
+          };
+          const VIDEO_TYPES = ["LIVE_WALLPAPER", "CHARGING_ANIMATION"];
+
+          function getItemContentType(item) {
+            if (item && item.contentType) return item.contentType;
+            const mp3 = item && (item.isMp3 || (item.name && item.name.toLowerCase().endsWith(".mp3")));
+            return mp3 ? "RINGTONE" : "WALLPAPER";
+          }
+
+          function slotFileUrl(item, slot) {
+            const v = item && item.files ? item.files[slot] : null;
+            return typeof v === "string" ? v : ((v && v.fileUrl) || "");
+          }
+
+          function hasSetFiles(item) {
+            const slots = SET_SLOTS[getItemContentType(item)];
+            if (!slots) return false;
+            return slots.every(s => slotFileUrl(item, s));
+          }
+
+          async function getNextWallpaperFromRealtimeDB(dayType, dayTypeLocked = false) {
+            console.log(`Checking Firebase Realtime Database queue... (Today's type: ${dayType}${dayTypeLocked ? " - LOCKED for today" : ""})`);
+            console.log(`ACTIVE_DB: ${firebaseDatabaseURL}`);
             const data = await firebaseGet(queuePath);
             if (!data) throw new Error(`No items found in Realtime Database (${firebaseDatabaseURL})`);
+
+            // STALE CLAIM RECOVERY: if a previous run crashed hard (runner killed),
+            // an item can stay stuck in "processing" forever and would never upload.
+            // Recover claims older than 3h back to "queued" (max 2 recoveries, then "failed"
+            // so a repeatedly-crashing item can never be uploaded twice by accident).
+            const STALE_CLAIM_MS = 3 * 60 * 60 * 1000;
+            for (const [sid, sitem] of Object.entries(data)) {
+              if (!sitem || sitem.status !== "processing") continue;
+              const claimAge = Date.now() - (sitem.processingAt || 0);
+              if (claimAge <= STALE_CLAIM_MS) continue;
+              const recoveries = (sitem.staleRecoveries || 0) + 1;
+              if (recoveries > 2) {
+                console.log(`STALE_CLAIM => "${sitem.name || sid}" crashed ${recoveries} times - marking failed (manual requeue needed).`);
+                await firebasePatch(`${queuePath}/${sid}`, { status: "failed", error: "Stale processing claim - run crashed repeatedly", failedAt: Date.now() });
+                sitem.status = "failed";
+              } else {
+                console.log(`STALE_CLAIM => "${sitem.name || sid}" stuck in processing for ${Math.round(claimAge / 60000)} min - recovering to queued (recovery #${recoveries}).`);
+                await firebasePatch(`${queuePath}/${sid}`, { status: "queued", claimToken: null, processingAt: null, staleRecoveries: recoveries });
+                sitem.status = "queued";
+              }
+            }
 
             const allQueued = Object.entries(data).filter(([_, item]) =>
               item &&
               item.status === "queued" &&
-              (item.fileBase64 || item.imageBase64 || item.fileUrl)
+              (item.fileBase64 || item.imageBase64 || item.fileUrl || hasSetFiles(item))
             );
 
-            const queuedAudio = allQueued.filter(([_, item]) =>
-              item.isMp3 || (item.name && item.name.toLowerCase().endsWith(".mp3"))
-            );
-            const queuedImage = allQueued.filter(([_, item]) =>
-              !(item.isMp3 || (item.name && item.name.toLowerCase().endsWith(".mp3")))
-            );
+            const typeCounts = {};
+            allQueued.forEach(([_, item]) => {
+              const t = getItemContentType(item);
+              typeCounts[t] = (typeCounts[t] || 0) + 1;
+            });
+            console.log(`QUEUE_COMPOSITION => total:${allQueued.length} | ${JSON.stringify(typeCounts)} | dayType:${dayType}`);
 
-            console.log(
-              `📊 Queue composition => total:${allQueued.length} | audio:${queuedAudio.length} | wallpaper:${queuedImage.length} | dayType:${dayType}`
-            );
+            // Which queue content type belongs to today's day type
+            const wantedType = dayType === "AUDIO" ? "RINGTONE" : dayType;
 
-            const entries = allQueued
-              .filter(([_, item]) => {
-                const itemIsMp3 = item.isMp3 || (item.name && item.name.toLowerCase().endsWith(".mp3"));
-                if (dayType === "AUDIO")     return itemIsMp3;   // 🎵 Ringtone day — MP3 only
-                if (dayType === "WALLPAPER") return !itemIsMp3;  // 🖼️ Wallpaper day — images only
-                return true;
-              })
+            // Pinned scheduling: items pinned to today's date (or overdue) take priority over the rotation
+            const todayKey = new Date(Date.now() + 6 * 3600 * 1000).toISOString().slice(0, 10);
+            const pinnedEntries = allQueued
+              .filter(([_, item]) => item.scheduledDate && item.scheduledDate <= todayKey)
+              .sort((a, b) =>
+                String(a[1].scheduledDate).localeCompare(String(b[1].scheduledDate)) ||
+                ((a[1].createdAt || 0) - (b[1].createdAt || 0))
+              );
+            if (pinnedEntries.length) {
+              console.log(`PINNED_QUEUE => ${pinnedEntries.length} item(s) pinned for <= ${todayKey}; pinned item overrides rotation type.`);
+            }
+
+            // Oldest-first queued entries of one content type (not scheduled for a future day)
+            const entriesOfType = (t) => allQueued
+              .filter(([_, item]) => (!item.scheduledDate || item.scheduledDate <= todayKey) && getItemContentType(item) === t)
               .sort((a, b) => (a[1].createdAt || 0) - (b[1].createdAt || 0));
 
+            // DAY-TYPE SKIP (strict "each content on its own day"):
+            // If today's type has nothing queued (and nothing is pinned), we do NOT borrow
+            // another type onto this day. Instead the DAY ITSELF becomes the next type in the
+            // cycle that actually has stock, and the rotation continues from there.
+            //   e.g. WALLPAPER day, 0 wallpapers, 0 24H, 4 dual  ->  today becomes DUAL day,
+            //        tomorrow is BATTERY day, and so on.
+            // The new day type is persisted to Firebase so all runs today + tomorrow's rotation agree.
+            // FULL-DAY RULE: a content type only gets a day when it has a FULL day of stock
+            // (MIN_STOCK_FOR_DAY = 3). Types with 1-2 items WAIT until restocked (or are pinned
+            // manually). Once a rotation upload happens the day type is LOCKED - it never
+            // switches mid-day, so a day always shows exactly one content type.
+            const MIN_STOCK_FOR_DAY = 3;
+            let pickedType = wantedType;
+            let effectiveDayType = dayType;
+            let dayTypeSwitchedTo = null;
+            let entries = pinnedEntries.length ? pinnedEntries : entriesOfType(wantedType);
+            if (!pinnedEntries.length) {
+              if (dayTypeLocked) {
+                if (!entries.length) {
+                  throw new Error(`DAY_LOCKED => today is a ${dayType} day (locked) and no more ${wantedType} queued. Not switching type mid-day - nothing more to upload today.`);
+                }
+              } else if (entries.length < MIN_STOCK_FOR_DAY) {
+                const TYPE_CYCLE_SKIP = ["AUDIO", "WALLPAPER", "WALLPAPER_24H", "WALLPAPER_DUAL", "WALLPAPER_BATTERY", "LIVE_WALLPAPER", "CHARGING_ANIMATION"];
+                const startIdx = Math.max(0, TYPE_CYCLE_SKIP.indexOf(dayType));
+                const waiting = [];
+                if (entries.length) waiting.push(`${wantedType}:${entries.length}/${MIN_STOCK_FOR_DAY}`);
+                let chosen = null;
+                for (let step = 1; step < TYPE_CYCLE_SKIP.length && !chosen; step++) {
+                  const tryDayType = TYPE_CYCLE_SKIP[(startIdx + step) % TYPE_CYCLE_SKIP.length];
+                  const tryType = tryDayType === "AUDIO" ? "RINGTONE" : tryDayType;
+                  const found = entriesOfType(tryType);
+                  if (found.length >= MIN_STOCK_FOR_DAY) {
+                    chosen = { tryDayType, tryType, found };
+                  } else if (found.length) {
+                    waiting.push(`${tryType}:${found.length}/${MIN_STOCK_FOR_DAY}`);
+                  }
+                }
+                if (!chosen) {
+                  throw new Error(`WAIT_FOR_STOCK => no content type has a full day of stock (>= ${MIN_STOCK_FOR_DAY}). Waiting: [${waiting.join(", ")}]. Add more files or pin an item manually. Nothing uploaded.`);
+                }
+                pickedType = chosen.tryType;
+                effectiveDayType = chosen.tryDayType;
+                dayTypeSwitchedTo = chosen.tryDayType;
+                entries = chosen.found;
+                console.log(`DAY_TYPE_SKIP => ${dayType} day has only ${entriesOfType(wantedType).length}/${MIN_STOCK_FOR_DAY} ${wantedType}; today is now a ${chosen.tryDayType} day (${chosen.found.length} available). Waiting for restock: [${waiting.join(", ") || "none"}]`);
+                // Persist immediately so the dashboard + later runs today see the switched type
+                await firebasePatch("uploadState", { uploadDayType: dayTypeSwitchedTo });
+              }
+            }
+
             if (!entries.length) {
-              const mismatchHint = dayType === "AUDIO"
-                ? `Today is AUDIO but queue has audio:${queuedAudio.length}, wallpaper:${queuedImage.length}`
-                : `Today is WALLPAPER but queue has wallpaper:${queuedImage.length}, audio:${queuedAudio.length}`;
-              throw new Error(`No queued ${dayType} item found. ${mismatchHint}. DB=${firebaseDatabaseURL}`);
+              throw new Error(`Queue is completely EMPTY - no uploadable item of ANY type found. Queue => ${JSON.stringify(typeCounts)}. DB=${firebaseDatabaseURL}`);
             }
 
             const [id, item] = entries[0];
             const localDir = path.join(process.cwd(), "downloads");
             fs.mkdirSync(localDir, { recursive: true });
 
-            const isMp3 = item.isMp3 || (item.name && item.name.toLowerCase().endsWith(".mp3"));
+            const contentType = getItemContentType(item);
+            const isMp3 = contentType === "RINGTONE";
 
-            // Defensive guard (double-check)
-            if ((dayType === "AUDIO" && !isMp3) || (dayType === "WALLPAPER" && isMp3)) {
-              throw new Error(
-                `Day/type mismatch guard triggered. dayType=${dayType}, item=${item.name || id}, isMp3=${isMp3}`
-              );
+            // Defensive guard (double-check); pinned and fallback picks may legally differ from the rotation type
+            const isPinnedPick = Boolean(item.scheduledDate && item.scheduledDate <= todayKey);
+            if (isPinnedPick) {
+              console.log(`PINNED_PICK => "${item.name || id}" was scheduled for ${item.scheduledDate} (today: ${todayKey})`);
+            } else if (contentType !== pickedType) {
+              throw new Error(`Day/type mismatch guard triggered. dayType=${effectiveDayType}, pickedType=${pickedType}, item=${item.name || id}, contentType=${contentType}`);
+            } else if (dayTypeSwitchedTo) {
+              console.log(`DAY_TYPE_SKIP_UPLOAD => uploading ${contentType} "${item.name || id}" - day switched ${dayType} -> ${dayTypeSwitchedTo} (no ${wantedType} queued).`);
             }
 
-            const isJpeg = item.name && item.name.toLowerCase().endsWith(".jpeg");
-            const ext = isMp3 ? ".mp3" : (isJpeg ? ".jpeg" : ".jpg");
-            const localFile = path.join(localDir, `${id}${ext}`);
-
-            console.log(`Saving queued item: ${item.name || id} as ${ext}`);
-            if (item.fileUrl) {
-              console.log(`Downloading file from R2: ${item.fileUrl}`);
-              const res = await fetch(item.fileUrl);
-              if (!res.ok) throw new Error(`Failed to download ${item.name || id} from R2: HTTP ${res.status}`);
-              const arrayBuffer = await res.arrayBuffer();
-              fs.writeFileSync(localFile, Buffer.from(arrayBuffer));
-            } else {
-              const base64Data = item.fileBase64 || item.imageBase64;
-              if (base64Data) {
-                const base64 = base64Data.includes(",")
-                  ? base64Data.split(",")[1]
-                  : base64Data;
-                fs.writeFileSync(localFile, Buffer.from(base64, "base64"));
-              } else {
-                throw new Error(`Queue item ${id} is missing both fileUrl and base64 data`);
-              }
-            }
-
+            // ANTI DOUBLE-UPLOAD GUARD: claim this item FIRST with a unique token,
+            // then verify we own the claim. If any other run already claimed this file,
+            // abort immediately so the same file can NEVER be uploaded twice.
+            const claimToken = `claim-${Date.now()}-${Math.random().toString(36).slice(2)}`;
             await firebasePatch(`${queuePath}/${id}`, {
               status: "processing",
-              processingAt: Date.now()
+              processingAt: Date.now(),
+              claimToken
             });
+            const claimCheck = await firebaseGet(`${queuePath}/${id}`);
+            if (!claimCheck || claimCheck.claimToken !== claimToken) {
+              throw new Error(`Queue item ${id} was already claimed by another run - aborting to prevent double upload.`);
+            }
+
+            async function downloadToFile(url, filePath, label) {
+              console.log(`Downloading ${label} from R2: ${url}`);
+              const res = await fetch(url);
+              if (!res.ok) throw new Error(`Failed to download ${label} from R2: HTTP ${res.status}`);
+              const arrayBuffer = await res.arrayBuffer();
+              fs.writeFileSync(filePath, Buffer.from(arrayBuffer));
+            }
+
+            let localFile;
+            let localFiles = [];
+            let fileUrls = [];
+            let localThumb = null;
+
+            if (SET_SLOTS[contentType]) {
+              // Multi-image set (24H / Dual / Battery) - download every slot image in order
+              if (!hasSetFiles(item)) {
+                throw new Error(`${contentType} item ${id} is missing one or more slot images (${SET_SLOTS[contentType].join(", ")})`);
+              }
+              for (const slot of SET_SLOTS[contentType]) {
+                const slotUrl = slotFileUrl(item, slot);
+                const slotFile = path.join(localDir, `${id}-${slot}.jpg`);
+                await downloadToFile(slotUrl, slotFile, `${contentType} ${slot} image`);
+                localFiles.push(slotFile);
+                fileUrls.push(slotUrl);
+              }
+              localFile = localFiles[0];
+              console.log(`${contentType} set ready - ${localFiles.length} images downloaded`);
+            } else if (VIDEO_TYPES.includes(contentType)) {
+              // Video content (Live Wallpaper / Charging Animation) + auto thumbnail
+              const isMov = item.name && item.name.toLowerCase().endsWith(".mov");
+              localFile = path.join(localDir, `${id}${isMov ? ".mov" : ".mp4"}`);
+              await downloadToFile(item.fileUrl, localFile, item.name || id);
+              localFiles = [localFile];
+              fileUrls = [item.fileUrl];
+              if (item.thumbUrl) {
+                localThumb = path.join(localDir, `${id}-thumb.jpg`);
+                await downloadToFile(item.thumbUrl, localThumb, "cover thumbnail");
+                fileUrls.push(item.thumbUrl);
+              } else {
+                console.warn(`${contentType} item ${id} has no thumbUrl - cover image step will be skipped`);
+              }
+            } else {
+              const isJpeg = item.name && item.name.toLowerCase().endsWith(".jpeg");
+              const ext = isMp3 ? ".mp3" : (isJpeg ? ".jpeg" : ".jpg");
+              localFile = path.join(localDir, `${id}${ext}`);
+
+              console.log(`Saving queued item: ${item.name || id} as ${ext}`);
+              if (item.fileUrl) {
+                await downloadToFile(item.fileUrl, localFile, item.name || id);
+              } else {
+                const base64Data = item.fileBase64 || item.imageBase64;
+                if (base64Data) {
+                  const base64 = base64Data.includes(",")
+                    ? base64Data.split(",")[1]
+                    : base64Data;
+                  fs.writeFileSync(localFile, Buffer.from(base64, "base64"));
+                } else {
+                  throw new Error(`Queue item ${id} is missing both fileUrl and base64 data`);
+                }
+              }
+              localFiles = [localFile];
+              if (item.fileUrl) fileUrls = [item.fileUrl];
+            }
+
+            // Item already claimed above (anti double-upload guard) - no re-claim needed.
 
             return {
               id,
               localFile,
+              localFiles,
+              localThumb,
+              contentType,
               isMp3,
+              dayTypeSwitchedTo,
+              isPinnedPick,
               name:        item.name || id,
               title:       item.title || "",
               tags:        item.tags || "",
               category:    item.category || "",
               description: item.description || "",
-              fileUrl:     item.fileUrl || ""
+              fileUrl:     item.fileUrl || "",
+              fileUrls
             };
           }
 
-          async function markWallpaperDoneAndDelete(id, name, fileUrl) {
-            console.log(`Upload successful — deleting "${name}" from Firebase...`);
+          async function markWallpaperDoneAndDelete(id, name, fileUrlOrUrls) {
+            console.log(`Upload successful - deleting "${name}" from Firebase...`);
             await firebaseDelete(`${queuePath}/${id}`);
             console.log(`"${name}" permanently removed from Firebase queue`);
 
-            if (fileUrl) {
+            const urls = (Array.isArray(fileUrlOrUrls) ? fileUrlOrUrls : [fileUrlOrUrls]).filter(Boolean);
+
+            for (const fileUrl of urls) {
               let fileKey = "";
               try {
                 const u = new URL(fileUrl);
@@ -614,15 +958,6 @@ jobs:
                   console.log(`Successfully deleted key "${fileKey}" from Cloudflare R2. Status=${res.status} Body=${body}`);
                 } else {
                   console.warn(`R2 delete failed for key "${fileKey}". Status=${res.status} Body=${body}`);
-                }
-
-                // Optional verification with cache-buster (non-blocking)
-                try {
-                  const verifyUrl = `${fileUrl}${fileUrl.includes("?") ? "&" : "?"}cb=${Date.now()}`;
-                  const vr = await fetch(verifyUrl, { method: "GET", cache: "no-store" });
-                  console.log(`Post-delete verification GET => ${verifyUrl} returned HTTP ${vr.status}`);
-                } catch (vErr) {
-                  console.log(`Post-delete verification skipped/failed: ${vErr.message}`);
                 }
               } catch (err) {
                 console.error(`Failed to delete "${fileKey}" from R2:`, err.message);
@@ -1081,13 +1416,14 @@ jobs:
               .first();
 
             await fileInput.waitFor({ state: "attached" });
-            console.log("Uploading file");
-            await fileInput.setInputFiles(localFile);
+            const filesToUpload = Array.isArray(localFile) ? localFile : [localFile];
+            console.log(`Uploading ${filesToUpload.length} file(s)`);
+            await fileInput.setInputFiles(filesToUpload);
 
-            await page.waitForFunction(() => {
+            await page.waitForFunction((expectedCount) => {
               const input = document.querySelector('input[data-hook="form-field-files-input"]');
-              return input && input.files && input.files.length > 0;
-            });
+              return input && input.files && input.files.length >= expectedCount;
+            }, filesToUpload.length);
 
             console.log("Waiting for Upload button to become enabled");
             const uploadButton = dialog
@@ -1132,6 +1468,50 @@ jobs:
             );
 
             await page.waitForTimeout(800);
+
+            // \u2500\u2500 COVER IMAGE (Live Wallpaper / Charging Animation) \u2500\u2500
+            if (meta.coverImage) {
+              try {
+                console.log("Uploading cover image (auto thumbnail)");
+                const addCover = page.locator('a:has-text("Add cover image")').first();
+                await addCover.waitFor({ state: "visible", timeout: 15000 });
+                await scrollToElement(addCover);
+                await addCover.click();
+                console.log("Clicked Add cover image");
+
+                const coverDialog = page.locator('[role="dialog"]').filter({ hasText: "Upload cover image" }).first();
+                await coverDialog.waitFor({ state: "visible", timeout: 15000 });
+
+                const coverInput = coverDialog.locator('input[data-hook="form-field-files-input"]').first();
+                await coverInput.waitFor({ state: "attached" });
+                await coverInput.setInputFiles(meta.coverImage);
+                console.log("Cover image file set");
+                await page.waitForTimeout(800);
+
+                for (const hook of ["form-field-accept-input", "form-field-acceptContentPolicy-input"]) {
+                  const cb = coverDialog.locator(`[data-hook="${hook}"]`).first();
+                  if (await cb.count()) {
+                    await cb.click({ force: true });
+                    await page.waitForTimeout(300);
+                  }
+                }
+
+                const coverSubmit = coverDialog.locator('button[type="submit"]:has-text("Upload")').first();
+                await page.waitForFunction(() => {
+                  const dialogs = [...document.querySelectorAll('[role="dialog"]')];
+                  const dlg = dialogs.find(d => d.textContent.includes("Upload cover image"));
+                  if (!dlg) return false;
+                  const btn = [...dlg.querySelectorAll('button[type="submit"]')].find(b => b.textContent.trim() === "Upload");
+                  return btn && btn.disabled === false;
+                }, { timeout: 20000 });
+                await coverSubmit.click();
+                await coverDialog.waitFor({ state: "detached", timeout: 30000 }).catch(() => {});
+                console.log("Cover image uploaded");
+                await page.waitForTimeout(1000);
+              } catch (e) {
+                console.warn(`Cover image upload issue (continuing): ${e.message}`);
+              }
+            }
 
             // ── TITLE ──────────────────────────────────────────────
             console.log("Filling title");
@@ -1386,7 +1766,7 @@ jobs:
             // ── Chrome on Linux ────────────────────────────────────────
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-            // ── Chrome on Windows (extra versions) ────────────────────
+            // ── Chrome on Windows (extra) ─────────────────────────────
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/113.0.0.0 Safari/537.36",
@@ -1399,13 +1779,13 @@ jobs:
             "Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            // ── Edge on Windows (extra versions) ──────────────────────
+            // ── Edge extra ────────────────────────────────────────────
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36 Edg/136.0.0.0",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36 Edg/129.0.0.0",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36 Edg/128.0.0.0",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
-            // ── Chrome on macOS (extra versions) ──────────────────────
+            // ── Chrome on macOS extra ─────────────────────────────────
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
@@ -1414,39 +1794,36 @@ jobs:
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-            // ── Safari on macOS ────────────────────────────────────────
+            // ── Safari on macOS ───────────────────────────────────────
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 12_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Safari/605.1.15",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.3 Safari/605.1.15",
-            // ── Firefox on Windows (extra versions) ───────────────────
+            // ── Firefox extra ─────────────────────────────────────────
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:138.0) Gecko/20100101 Firefox/138.0",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:137.0) Gecko/20100101 Firefox/137.0",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
-            // ── Firefox on macOS ───────────────────────────────────────
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:136.0) Gecko/20100101 Firefox/136.0",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:130.0) Gecko/20100101 Firefox/130.0",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:124.0) Gecko/20100101 Firefox/124.0",
-            // ── Opera on Windows ───────────────────────────────────────
+            // ── Opera / Brave ─────────────────────────────────────────
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 OPR/118.0.0.0",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 OPR/115.0.0.0",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 OPR/110.0.0.0",
-            // ── Brave on Windows ───────────────────────────────────────
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36 Brave/135",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Brave/130",
-            // ── Chrome on Android (mobile) ─────────────────────────────
+            // ── Android Chrome ────────────────────────────────────────
             "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.6478.122 Mobile Safari/537.36",
             "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.6998.135 Mobile Safari/537.36",
             "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.6723.86 Mobile Safari/537.36",
             "Mozilla/5.0 (Linux; Android 14; SM-A546E) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.6613.127 Mobile Safari/537.36",
             "Mozilla/5.0 (Linux; Android 12; Redmi Note 11) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.82 Mobile Safari/537.36",
-            // ── Samsung Internet on Android ────────────────────────────
             "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/27.0 Chrome/130.0.0.0 Mobile Safari/537.36",
             "Mozilla/5.0 (Linux; Android 13; SM-A546B) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/25.0 Chrome/121.0.0.0 Mobile Safari/537.36",
-            // ── Chrome on Linux (extra) ────────────────────────────────
+            // ── Linux extra ───────────────────────────────────────────
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
             "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:136.0) Gecko/20100101 Firefox/136.0",
@@ -1486,7 +1863,10 @@ jobs:
               // 1. Check Limits & figure out how many uploads we can still do today
               const ZEDGE_DAILY_LIMIT = 3;
               const profileStateData = await getProfileState(TOTAL_PROFILES);
-              const remainingUploads = ZEDGE_DAILY_LIMIT - profileStateData.state.totalUploadsToday;
+              // 3 runs per day (morning / noon / evening) - upload only 1 item per run.
+              // Daily cap of ZEDGE_DAILY_LIMIT (3) is still enforced across all runs of the day.
+              const UPLOADS_PER_RUN = 1;
+              const remainingUploads = Math.min(UPLOADS_PER_RUN, ZEDGE_DAILY_LIMIT - profileStateData.state.totalUploadsToday);
               let currentProfileIndex = profileStateData.nextProfileIndex;
               const perProfileLimit   = profileStateData.perProfileLimit;
               let currentState = profileStateData.state;
@@ -1494,8 +1874,9 @@ jobs:
               console.log(`✅ Approved. Starting at profile index: ${currentProfileIndex}. Can do ${remainingUploads} upload(s) this run.`);
 
               // ── Read today's upload type from Firebase state ──────────────────────────────
-              const dayType = profileStateData.state.uploadDayType || "AUDIO";
-              console.log(`📅 Today's upload type: ${dayType === "AUDIO" ? "🎵 AUDIO (Ringtone)" : "🖼️ WALLPAPER (Image)"} day`);
+              let dayType = profileStateData.state.uploadDayType || "AUDIO";
+              const DAY_TYPE_LOGS = { AUDIO: "🎵 AUDIO (Ringtone)", WALLPAPER: "🖼️ WALLPAPER (Image)", WALLPAPER_24H: "🌅 DYNAMIC 24H WALLPAPER", WALLPAPER_DUAL: "🔒 DUAL WALLPAPER", WALLPAPER_BATTERY: "🔋 BATTERY WALLPAPER", LIVE_WALLPAPER: "🎬 LIVE WALLPAPER", CHARGING_ANIMATION: "⚡ CHARGING ANIMATION" };
+              console.log(`📅 Today's upload type: ${DAY_TYPE_LOGS[dayType] || dayType} day`);
 
               // 2. Filter UA pool by selected group then pick random fingerprint
               const UA_GROUP_SEL = (process.env.UA_GROUP || "random").toLowerCase();
@@ -1510,7 +1891,7 @@ jobs:
               const fpUAPool = (UA_GROUPS_MAP[UA_GROUP_SEL] && UA_GROUPS_MAP[UA_GROUP_SEL].length > 0)
                 ? UA_GROUPS_MAP[UA_GROUP_SEL]
                 : FP_USER_AGENTS;
-              console.log(`\ud83c\udf10 UA Group: "${UA_GROUP_SEL}" → pool size: ${fpUAPool.length}`);
+              console.log(`🌐 UA Group: "${UA_GROUP_SEL}" → pool size: ${fpUAPool.length}`);
               const fpVP       = fpRand(FP_VIEWPORTS);
               const fpUA       = fpRand(fpUAPool);
               const fpHC       = fpRand(FP_HC);
@@ -1939,6 +2320,30 @@ jobs:
               // 5. UPLOAD LOOP — repeat up to remainingUploads times
               // ─────────────────────────────────────────────────────────────
               let successCount = 0;
+              let failedCount = 0;
+              let removedCount = 0;
+              const runStartedAt = Date.now();
+              const runLabel = process.env.FOLDER_NAME || "Zedge Bot";
+              const DAILY_LIMIT_UI = 3; // matches ZEDGE_DAILY_LIMIT
+              const DAY_TYPE_BN = { AUDIO: "🎵 রিংটোন ডে", WALLPAPER: "🖼️ ওয়ালপেপার ডে", WALLPAPER_24H: "🌅 ২৪ ঘণ্টার ওয়ালপেপার ডে", WALLPAPER_DUAL: "🔒 ডুয়াল ওয়ালপেপার ডে", WALLPAPER_BATTERY: "🔋 ব্যাটারি ওয়ালপেপার ডে", LIVE_WALLPAPER: "🎬 লাইভ ওয়ালপেপার ডে", CHARGING_ANIMATION: "⚡ চার্জিং অ্যানিমেশন ডে" };
+              const CTYPE_BN = {
+                RINGTONE: "অডিও (রিংটোন)",
+                WALLPAPER: "ওয়ালপেপার",
+                WALLPAPER_24H: "২৪ ঘণ্টার ওয়ালপেপার সেট",
+                WALLPAPER_DUAL: "ডুয়াল ওয়ালপেপার সেট",
+                WALLPAPER_BATTERY: "ব্যাটারি ওয়ালপেপার সেট",
+                LIVE_WALLPAPER: "লাইভ ওয়ালপেপার",
+                CHARGING_ANIMATION: "চার্জিং অ্যানিমেশন"
+              };
+              const STATUS_UI = {
+                PUBLISHED: "✅ PUBLISHED", "IN REVIEW": "🔍 IN REVIEW", PENDING: "⏳ PENDING", REJECTED: "⛔ REJECTED", UNKNOWN: "❓ UNKNOWN"
+              };
+              const ctypeLabel = (qi) => CTYPE_BN[qi?.contentType] || (qi?.isMp3 ? CTYPE_BN.RINGTONE : CTYPE_BN.WALLPAPER);
+              // Card-style message builder: header line + key/value rows + footer
+              const tgCard = (header, rows, footer) => {
+                const body = rows.filter(r => r && r[1] !== undefined && r[1] !== null && r[1] !== "").map(([k, v]) => `${k} ${v}`).join("\n");
+                return [header, "━━━━━━━━━━━━━━━━", body, footer ? `\n${footer}` : ""].filter(Boolean).join("\n");
+              };
 
               for (let i = 0; i < remainingUploads; i++) {
                 let queueItem = null;
@@ -1950,9 +2355,43 @@ jobs:
 
                 try {
                   // Fetch the next queued item
-                  queueItem = await getNextWallpaperFromRealtimeDB(dayType);
+                  const dayTypeLocked = Boolean(currentState.dayTypeLockedDate) && currentState.dayTypeLockedDate === currentState.lastUploadDate;
+                  queueItem = await getNextWallpaperFromRealtimeDB(dayType, dayTypeLocked);
+                  if (queueItem.dayTypeSwitchedTo && queueItem.dayTypeSwitchedTo !== dayType) {
+                    // Keep local state in sync so updateProfileStateAfterUpload() does not
+                    // write the OLD day type back to Firebase, and so tomorrow rotates from the new one.
+                    dayType = queueItem.dayTypeSwitchedTo;
+                    currentState = { ...currentState, uploadDayType: dayType };
+                    console.log(`📅 Day type switched -> ${DAY_TYPE_LOGS[dayType] || dayType} day (own type had no stock).`);
+                  }
                 } catch (e) {
-                  console.log(`Queue is empty after ${successCount} upload(s). Stopping loop.`);
+                  const reason = e && e.message ? e.message : String(e);
+                  console.log(`Nothing to upload after ${successCount} upload(s): ${reason}`);
+                  console.log("Stopping loop.");
+                  // Tell the user WHY nothing was uploaded (only when this run did nothing at all)
+                  if (successCount === 0 && i === 0) {
+                    let why = "কিউতে আপলোড করার মতো কোনো ফাইল নেই।";
+                    let hint = "💡 ড্যাশবোর্ড থেকে নতুন ফাইল অ্যাড করুন।";
+                    if (/WAIT_FOR_STOCK/.test(reason)) {
+                      const waitingList = (reason.match(/Waiting: \[([^\]]*)\]/) || [])[1] || "";
+                      why = "কোনো কনটেন্ট টাইপের পুরো এক দিনের স্টক (৩টি ফাইল) নেই।";
+                      hint = `⏳ অপেক্ষায়: <code>${tgEscape(waitingList || "-")}</code>\n💡 আরও ফাইল অ্যাড করুন অথবা ক্যালেন্ডারে ম্যানুয়ালি পিন করুন।`;
+                    } else if (/DAY_LOCKED/.test(reason)) {
+                      why = "আজকের কনটেন্ট টাইপের আর কোনো ফাইল কিউতে নেই। দিনের টাইপ লক থাকায় অন্য টাইপ নেওয়া হয়নি।";
+                      hint = "💡 আগামীকাল রোটেশন স্বাভাবিকভাবে পরের টাইপে যাবে।";
+                    }
+                    const idleMsg = tgCard(
+                      `ℹ️ <b>আজ কোনো আপলোড হয়নি</b>`,
+                      [
+                        ["📁 প্রজেক্ট:", tgEscape(runLabel)],
+                        ["📅 আজকের ডে:", DAY_TYPE_BN[dayType] || dayType],
+                        ["📝 কারণ:", why],
+                        ["🕒 সময়:", fmtDhakaTime()]
+                      ],
+                      hint
+                    );
+                    await sendTelegramNotification(idleMsg);
+                  }
                   break;
                 }
 
@@ -1983,7 +2422,17 @@ jobs:
                   // URL shape: .../profiles/<profileId>/content/WALLPAPER  (or AUDIO)
                   const profilePageUrl = page.url();
                   const profileBase    = profilePageUrl.replace(/\/content\/[^\/].*$/, "");
-                  const targetType     = queueItem.isMp3 ? "AUDIO" : "WALLPAPER";
+                  const ZEDGE_TYPE_URLS = {
+                    RINGTONE: "AUDIO",
+                    WALLPAPER: "WALLPAPER",
+                    WALLPAPER_24H: "DYNAMIC_24H_WALLPAPER",
+                    WALLPAPER_DUAL: "DYNAMIC_DUAL_LOCK_WALLPAPER",
+                    WALLPAPER_BATTERY: "DYNAMIC_BATTERY_LEVEL_WALLPAPER",
+                    LIVE_WALLPAPER: "LIVE_WALLPAPER",
+                    CHARGING_ANIMATION: "CHARGE_SCREEN"
+                  };
+                  const itemCType = queueItem.contentType || (queueItem.isMp3 ? "RINGTONE" : "WALLPAPER");
+                  const targetType = ZEDGE_TYPE_URLS[itemCType] || (queueItem.isMp3 ? "AUDIO" : "WALLPAPER");
                   const targetContentUrl = `${profileBase}/content/${targetType}`;
                   console.log(`Navigating directly to ${targetType} page: ${targetContentUrl}`);
                   await page.goto(targetContentUrl, { waitUntil: "domcontentloaded" });
@@ -2000,27 +2449,38 @@ jobs:
                   await page.waitForTimeout(800);
                   await page.screenshot({ path: `zedge-upload-menu-${uploadNum}.png`, fullPage: false });
 
-                  // Upload the file
-                  await uploadWallpaperInDialog(page, queueItem.localFile);
+                  // Upload the file(s) - 24H sets pass all 4 images at once
+                  const filesForUpload = (queueItem.localFiles && queueItem.localFiles.length) ? queueItem.localFiles : queueItem.localFile;
+                  await uploadWallpaperInDialog(page, filesForUpload);
 
                   // Fill in meta (title, tags, category, description)
                   await fillMetaDialog(page, {
                     title:       queueItem.title,
                     tags:        queueItem.tags,
                     category:    queueItem.category,
-                    description: queueItem.description
+                    description: queueItem.description,
+                    coverImage:  queueItem.localThumb || null
                   });
 
                   // Check publish status — returns {removed, statusName} instead of throwing
                   const publishResult = await verifyPublishStatus(page);
 
-                  await page.screenshot({ path: `zedge-final-${uploadNum}.png`, fullPage: true });
+                  const finalShotPath = `zedge-final-${uploadNum}.png`;
+                  await page.screenshot({ path: finalShotPath, fullPage: true });
 
                   // Always delete from Firebase queue and count the upload on the profile,
                   // regardless of whether it was PUBLISHED or removed (PENDING/IN REVIEW/REJECTED).
                   // Only a true technical error (catch block) skips this.
-                  await markWallpaperDoneAndDelete(queueItem.id, queueItem.name, queueItem.fileUrl);
+                  await markWallpaperDoneAndDelete(queueItem.id, queueItem.name, (queueItem.fileUrls && queueItem.fileUrls.length) ? queueItem.fileUrls : queueItem.fileUrl);
                   await updateProfileStateAfterUpload(currentState, currentProfileIndex);
+
+                  // LOCK today's day type after the first rotation (non-pinned) upload,
+                  // so the type can never switch mid-day.
+                  if (!queueItem.isPinnedPick && currentState.dayTypeLockedDate !== currentState.lastUploadDate) {
+                    await firebasePatch("uploadState", { dayTypeLockedDate: currentState.lastUploadDate });
+                    currentState = { ...currentState, dayTypeLockedDate: currentState.lastUploadDate };
+                    console.log(`🔒 Day type ${dayType} locked for today.`);
+                  }
 
                   // Advance local state for next iteration
                   const profileUploadCounts = { ...(currentState.profileUploadCounts || {}) };
@@ -2034,19 +2494,52 @@ jobs:
 
                   successCount++;
 
-                  const folderLabel = process.env.FOLDER_NAME || "Zedge Bot";
-                  const fileTypeBn = queueItem.isMp3 ? "রিংটোন" : "ওয়ালপেপার";
-                  const fileTypeSuffix = queueItem.isMp3 ? "রিংটোনটি" : "ওয়ালপেপারটি";
+                  const fileTypeLabel = ctypeLabel(queueItem);
                   const greeting = getDhakaGreeting();
+                  const statusLine = `<b>${STATUS_UI[publishResult.statusName] || tgEscape(publishResult.statusName)}</b>`;
+                  const todayProgress = `${currentState.totalUploadsToday}/${DAILY_LIMIT_UI}`;
+                  const itemTitle = tgEscape(queueItem.title || queueItem.name);
                   let notifyMsg = "";
                   if (publishResult.removed) {
-                    notifyMsg = `${greeting} Zedge কিন্তু ${folderLabel} এর Profile #${currentProfileIndex} থেকে "${queueItem.name}" ${fileTypeBn}টি অটো-রিজেক্ট করে দিয়েছে। স্ট্যাটাস দেখালো: ${publishResult.statusName}। ${fileTypeSuffix} সঠিক ভাবে পাবলিশড করতেই পারলাম না.। 😢`;
+                    removedCount++;
+                    notifyMsg = tgCard(
+                      `⚠️ <b>Zedge কনটেন্ট সরিয়ে দিয়েছে</b>`,
+                      [
+                        ["👋", `${greeting}।`],
+                        ["📁 প্রজেক্ট:", `${tgEscape(runLabel)} · প্রোফাইল #${currentProfileIndex}`],
+                        ["🗂 কনটেন্ট:", fileTypeLabel],
+                        ["🏷 টাইটেল:", `<b>“${itemTitle}”</b>`],
+                        ["📌 Zedge স্ট্যাটাস:", statusLine],
+                        ["📅 আজকের ডে:", `${DAY_TYPE_BN[dayType] || dayType} · আপলোড ${todayProgress}`],
+                        ["🕒 সময়:", fmtDhakaTime()]
+                      ],
+                      "💡 ফাইলটি কিউ থেকে সরানো হয়েছে এবং আজকের আপলোড লিমিটে গণনা করা হয়েছে। Zedge এটি রিভিউয়ে রেখেছে/রিজেক্ট করেছে — কনটেন্ট গাইডলাইন চেক করে দেখুন।"
+                    );
                     console.log(`⚠️ Upload ${uploadNum} was removed from Zedge (Status: ${publishResult.statusName}). Counted as upload attempt. (${successCount} this run)`);
                   } else {
-                    notifyMsg = `${greeting} আমি মাত্র ${folderLabel} এর Profile #${currentProfileIndex}-এ "${queueItem.title || queueItem.name}" ${fileTypeBn}টি আপলোড করলাম। ${fileTypeSuffix} সঠিক ভাবে পাবলিশড হয়েছে । 😊`;
+                    notifyMsg = tgCard(
+                      `✅ <b>আপলোড সম্পন্ন</b>`,
+                      [
+                        ["👋", `${greeting}।`],
+                        ["📁 প্রজেক্ট:", `${tgEscape(runLabel)} · প্রোফাইল #${currentProfileIndex}`],
+                        ["🗂 কনটেন্ট:", fileTypeLabel],
+                        ["🏷 টাইটেল:", `<b>“${itemTitle}”</b>`],
+                        ["📌 Zedge স্ট্যাটাস:", statusLine],
+                        ["📅 আজকের ডে:", `${DAY_TYPE_BN[dayType] || dayType} · আপলোড ${todayProgress}`],
+                        ["🕒 সময়:", fmtDhakaTime()]
+                      ],
+                      publishResult.statusName === "PUBLISHED"
+                        ? "🎉 কনটেন্টটি এখন Zedge-এ লাইভ।"
+                        : "⏳ Zedge রিভিউ শেষ হলে লাইভ হবে।"
+                    );
                     console.log(`✅ Upload ${uploadNum} complete! Status: ${publishResult.statusName}. (${successCount} this run)`);
                   }
-                  await sendFacebookNotification(notifyMsg);
+                  
+                  if (publishResult.statusName === "PUBLISHED" || publishResult.statusName === "IN REVIEW" || publishResult.statusName === "REJECTED") {
+                    await sendTelegramAttachment(finalShotPath, "image", notifyMsg);
+                  } else {
+                    await sendTelegramNotification(notifyMsg);
+                  }
 
                 } catch (uploadErr) {
                   console.error(`❌ Upload ${uploadNum} failed with a technical error: ${uploadErr.message}`);
@@ -2054,15 +2547,30 @@ jobs:
                     await markWallpaperFailed(queueItem.id, uploadErr.message).catch(() => {});
                   }
                   // Take a failure screenshot and continue to next upload
-                  await page.screenshot({ path: `zedge-error-upload-${uploadNum}.png`, fullPage: true }).catch(() => {});
+                  const errShotPath = `zedge-error-upload-${uploadNum}.png`;
+                  await page.screenshot({ path: errShotPath, fullPage: true }).catch(() => {});
                   console.log("Continuing to next upload despite error...");
                   // Notify user of upload failure
+                  failedCount++;
                   try {
-                    const errFolder = process.env.FOLDER_NAME || "Zedge Bot";
-                    const fileTypeBn = queueItem?.isMp3 ? "রিংটোন" : "ওয়ালপেপার";
-                    const errSnippet = String(uploadErr.message || "Unknown error").slice(0, 120);
-                    const uploadErrMsg = `${getDhakaGreeting()} ${errFolder} এর Profile #${currentProfileIndex}-এ "${queueItem?.name || "N/A"}" ${fileTypeBn}টি আপলোড করতে পারলাম না। সমস্যা: ${errSnippet}। আমি পরের ফাইলটা ট্রাই করছি।`;
-                    await sendFacebookNotification(uploadErrMsg);
+                    const errSnippet = tgEscape(String(uploadErr.message || "Unknown error").slice(0, 160));
+                    const uploadErrMsg = tgCard(
+                      `❌ <b>আপলোড ব্যর্থ</b>`,
+                      [
+                        ["👋", `${getDhakaGreeting()}।`],
+                        ["📁 প্রজেক্ট:", `${tgEscape(runLabel)} · প্রোফাইল #${currentProfileIndex}`],
+                        ["🗂 কনটেন্ট:", ctypeLabel(queueItem)],
+                        ["🏷 টাইটেল:", `<b>“${tgEscape(queueItem?.title || queueItem?.name || "N/A")}”</b>`],
+                        ["🧩 ত্রুটি:", `<code>${errSnippet}</code>`],
+                        ["🕒 সময়:", fmtDhakaTime()]
+                      ],
+                      "🔁 ফাইলটি কিউতে <b>failed</b> মার্ক করা হয়েছে (ড্যাশবোর্ড থেকে requeue করতে পারেন)। পরবর্তী ফাইলে যাচ্ছি…"
+                    );
+                    if (fs.existsSync(errShotPath)) {
+                      await sendTelegramAttachment(errShotPath, "image", uploadErrMsg);
+                    } else {
+                      await sendTelegramNotification(uploadErrMsg);
+                    }
                   } catch (_) {}
                 }
 
@@ -2086,12 +2594,14 @@ jobs:
 
               // Save video recording before closing browser
               console.log("\n📹 Saving screen recording...");
+              let savedVideoPath = "";
               try {
                 const pages = context.pages();
                 if (pages.length > 0) {
                   const videoPath = await pages[0].video()?.path();
                   if (videoPath) {
                     console.log(`✅ Video saved to: ${videoPath}`);
+                    savedVideoPath = videoPath;
                   }
                 }
               } catch (videoErr) {
@@ -2102,9 +2612,33 @@ jobs:
               // Wait 2 seconds for video to finish writing to disk
               await new Promise(resolve => setTimeout(resolve, 2000));
               console.log("✅ Video recording finalized.");
+
+              if (savedVideoPath) {
+                console.log("Sending video to Telegram...");
+                const attempted = successCount + failedCount;
+                const published = successCount - removedCount;
+                const runHeader = failedCount === 0
+                  ? `🏁 <b>রান সম্পন্ন</b>`
+                  : `🏁 <b>রান শেষ — আংশিক সফল</b>`;
+                const videoCaption = tgCard(
+                  runHeader,
+                  [
+                    ["👋", `${getDhakaGreeting()}।`],
+                    ["📁 প্রজেক্ট:", tgEscape(runLabel)],
+                    ["📅 আজকের ডে:", DAY_TYPE_BN[dayType] || dayType],
+                    ["📊 ফলাফল:", `${published} লাইভ/রিভিউ · ${removedCount} সরানো · ${failedCount} ব্যর্থ (মোট ${attempted})`],
+                    ["📈 আজ মোট:", `${currentState.totalUploadsToday}/${DAILY_LIMIT_UI} আপলোড`],
+                    ["⏱ সময় লেগেছে:", fmtDuration(Date.now() - runStartedAt)],
+                    ["🕒 শেষ:", fmtDhakaTime()]
+                  ],
+                  "🎬 পুরো রানের স্ক্রিন রেকর্ডিং সংযুক্ত।"
+                );
+                await sendTelegramAttachment(savedVideoPath, "video", videoCaption, { width: fpVP.width, height: fpVP.height });
+              }
+
               await browser.close();
               
-              // Exit cleanly to allow GitHub Actions to proceed to artifact upload
+              // Exit cleanly
               process.exit(0);
 
             } catch (err) {
@@ -2112,11 +2646,38 @@ jobs:
               // Notify user of fatal crash before exiting
               try {
                 const crashFolder = process.env.FOLDER_NAME || "Zedge Bot";
-                const crashSnippet = String(err?.message || err || "Unknown fatal error").slice(0, 150);
-                const fatalMsg = `${getDhakaGreeting()} কোনো একটা সমস্যার কারণে ${crashFolder} এর কাজটা পুরোপুরি বন্ধ হয়ে গিয়েছে। এরর মেসেজ: ${crashSnippet}।`;
-                await sendFacebookNotification(fatalMsg);
+                const crashSnippet = tgEscape(String(err?.message || err || "Unknown fatal error").slice(0, 200));
+                const fatalMsg = [
+                  `🚨 <b>সিস্টেম ক্র্যাশ রিপোর্ট</b>`,
+                  "━━━━━━━━━━━━━━━━",
+                  `👋 ${getDhakaGreeting()}।`,
+                  `📁 প্রজেক্ট: ${tgEscape(crashFolder)}`,
+                  `📝 অবস্থা: রান চলাকালে মারাত্মক ত্রুটি — রান বন্ধ হয়ে গেছে।`,
+                  `🧩 ত্রুটি: <code>${crashSnippet}</code>`,
+                  `🕒 সময়: ${fmtDhakaTime()}`,
+                  "",
+                  "🔎 GitHub Actions লগ দেখুন। ক্র্যাশ রেকর্ডিং থাকলে পরের মেসেজে পাবেন।"
+                ].join("\n");
+                await sendTelegramNotification(fatalMsg);
               } catch (_) {}
+
+              let fatalVideoPath = "";
+              try {
+                if (context) {
+                  const pages = context.pages();
+                  if (pages.length > 0) {
+                    fatalVideoPath = await pages[0].video()?.path() || "";
+                  }
+                }
+              } catch (_) {}
+
               if (context) await context.close().catch(() => {});
+              if (fatalVideoPath) {
+                await new Promise(resolve => setTimeout(resolve, 2000));
+                const crashFolder = process.env.FOLDER_NAME || "Zedge Bot";
+                const videoCaption = `🎬 <b>ক্র্যাশ রেকর্ডিং</b> · ${tgEscape(crashFolder)} · ${fmtDhakaTime()}`;
+                await sendTelegramAttachment(fatalVideoPath, "video", videoCaption).catch(() => {});
+              }
               if (browser) await browser.close().catch(() => {});
               process.exit(1);
             }
@@ -2137,19 +2698,3 @@ jobs:
           FOLDER_NAME: "Zedge 3"
 
         run: node bot.js
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: zedge-artifacts
-          path: |
-            zedge-before-login.png
-            zedge-after-login.png
-            zedge-upload-menu-*.png
-            zedge-after-type-click-*.png
-            zedge-dialog-error.png
-            zedge-error-upload-*.png
-            zedge-final-*.png
-            videos/
-            downloads/
