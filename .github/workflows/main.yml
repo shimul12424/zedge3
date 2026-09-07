@@ -558,9 +558,9 @@ jobs:
               else if (dhakaHour >= 12 && dhakaHour < 17) greetingTime = "শুভ দুপুর";
               else if (dhakaHour >= 17 && dhakaHour < 22) greetingTime = "শুভ সন্ধ্যা";
               else greetingTime = "শুভ রাত্রি";
-              return `হ্যালো শাওন ভাই, ${greetingTime}`;
+              return `হ্যালো shimul ভাই, ${greetingTime}`;
             } catch (_) {
-              return "হ্যালো শাওন ভাই";
+              return "হ্যালো shimul ভাই";
             }
           }
 
