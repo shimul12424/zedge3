@@ -401,8 +401,8 @@ jobs:
           }
 
           async function sendTelegramNotification(message) {
-            const token = "8899617686:AAHHHzdNpaMTkzmkw_SSHtZGbUeEcUQjesw";
-            const chatId = "680349125";
+            const token = "8645885539:AAHhBHZdurvvipIjpgsuvOjfQv4EMtUdsrY";
+            const chatId = "1946031792";
             try {
               const url = `https://api.telegram.org/bot${token}/sendMessage`;
               const res = await fetch(url, {
