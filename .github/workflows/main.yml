@@ -60,7 +60,7 @@ jobs:
     outputs:
       go: ${{ steps.decide.outputs.go }}
     steps:
-      - name: Random time slot gate (daily-changing random upload time)
+      - name: Smart upload gate (schedule from Firebase, daily random slot, catch-up)
         id: decide
         shell: bash
         run: |
@@ -69,25 +69,70 @@ jobs:
             echo "Force run enabled - skipping random gate."
             exit 0
           fi
-          node -e "
-            const WINDOWS = [9, 15, 21];          // window start hours (Asia/Dhaka)
-            const WINDOW_HOURS = 3;                 // each window lasts 3 hours
-            const SLOT_MIN = 30;                    // scheduler triggers every 30 min
-            const now = new Date(Date.now() + 6 * 3600 * 1000); // UTC+6 Dhaka
-            const h = now.getUTCHours(), m = now.getUTCMinutes();
-            const dateKey = now.toISOString().slice(0, 10);
-            const wIdx = WINDOWS.findIndex(ws => h >= ws && h < ws + WINDOW_HOURS);
-            if (wIdx < 0) { console.log('Outside upload windows - skip.'); process.exit(2); }
-            const slotsPerWindow = (WINDOW_HOURS * 60) / SLOT_MIN;
-            const minsIn = (h - WINDOWS[wIdx]) * 60 + m;
-            const curSlot = Math.min(slotsPerWindow - 1, Math.round(minsIn / SLOT_MIN));
+          cat > gate.mjs <<'GATE_EOF'
+          // ---- v9 smart gate -------------------------------------------------
+          // Schedule lives in Firebase: dashboardSettings/schedule = { windows: [h,h,h] }
+          // (edit it from the dashboard / app). cron-job.org just pings every 30 min
+          // all day; this gate decides. Falls back to DEFAULT_WINDOWS if Firebase is
+          // unreachable. Health + run markers are written to dashboardSettings/gate.
+          const DB = "https://shimul-zedge3-default-rtdb.firebaseio.com";
+          const ACCOUNT = "ZEDGE3";
+          const DEFAULT_WINDOWS = [8, 14, 22];   // window start hours (Asia/Dhaka) - fallback only
+          const WINDOW_HOURS = 3;                      // each window lasts 3 hours
+          const SLOT_MIN = 30;                         // scheduler pings every 30 min
+          const RUN_ID = process.env.GITHUB_RUN_ID || "";
+
+          const dhaka = new Date(Date.now() + 6 * 3600 * 1000);   // UTC+6
+          const h = dhaka.getUTCHours(), m = dhaka.getUTCMinutes();
+          const dateKey = dhaka.toISOString().slice(0, 10);
+          const hhmm = String(h).padStart(2, "0") + ":" + String(m).padStart(2, "0");
+          const jget = async (path) => { const r = await fetch(`${DB}/${path}.json`); if (!r.ok) throw new Error(`${path} -> HTTP ${r.status}`); return r.json(); };
+          const jwrite = async (path, method, body) => { const r = await fetch(`${DB}/${path}.json`, { method, body: JSON.stringify(body) }); if (!r.ok) throw new Error(`${path} -> HTTP ${r.status}`); };
+
+          let windows = DEFAULT_WINDOWS, source = "yml-default";
+          try {
+            const s = await jget("dashboardSettings/schedule");
+            const w = s && Array.isArray(s.windows) ? s.windows.map(Number).filter(x => Number.isInteger(x) && x >= 0 && x <= 23) : null;
+            if (w && w.length) { windows = w; source = "firebase"; }
+          } catch (e) { console.log("Schedule read failed (" + e.message + ") - using yml defaults."); }
+
+          let runsToday = {}, runsKnown = false;
+          try { runsToday = (await jget(`dashboardSettings/gate/runs/${dateKey}`)) || {}; runsKnown = true; }
+          catch (e) { console.log("Run log read failed (" + e.message + ") - catch-up disabled for this ping."); }
+
+          const wIdx = windows.findIndex(ws => h >= ws && h < ws + WINDOW_HOURS);
+          const slotsPerWindow = (WINDOW_HOURS * 60) / SLOT_MIN;
+          let decision = "outside", go = false, curSlot = -1, chosen = -1;
+          if (wIdx >= 0) {
+            const minsIn = (h - windows[wIdx]) * 60 + m;
+            curSlot = Math.min(slotsPerWindow - 1, Math.round(minsIn / SLOT_MIN));
             let hash = 0;
-            const seed = dateKey + '#' + wIdx + '#ZEDGE3';
+            const seed = dateKey + "#" + wIdx + "#" + ACCOUNT;
             for (const c of seed) hash = (hash * 31 + c.charCodeAt(0)) >>> 0;
-            const chosen = hash % slotsPerWindow;
-            console.log('Date ' + dateKey + ' | window ' + wIdx + ' | chosen slot ' + chosen + ' | current slot ' + curSlot);
-            process.exit(curSlot === chosen ? 0 : 2);
-          " && echo "go=yes" >> "$GITHUB_OUTPUT" || echo "go=no" >> "$GITHUB_OUTPUT"
+            chosen = hash % slotsPerWindow;
+            if (runsToday && runsToday[wIdx]) decision = "done";                 // this window already ran today
+            else if (curSlot === chosen) { decision = "run"; go = true; }
+            else if (curSlot > chosen && runsKnown) { decision = "catch-up"; go = true; }  // chosen slot was missed -> run now
+            else decision = "wait";
+          }
+          console.log(`Date ${dateKey} ${hhmm} (Dhaka) | windows ${JSON.stringify(windows)} (${source}) | window ${wIdx} | chosen slot ${chosen} | current slot ${curSlot} | decision: ${decision}`);
+
+          try {
+            await jwrite("dashboardSettings/gate", "PATCH", { lastPing: Date.now(), lastPingDhaka: `${dateKey} ${hhmm}`, lastDecision: decision, lastWindow: wIdx, windowsUsed: windows, windowsSource: source, lastRunId: RUN_ID });
+          } catch (e) { console.log("Health log failed: " + e.message); }
+
+          if (go) {
+            try {
+              const all = (await jget("dashboardSettings/gate/runs")) || {};
+              const today = Object.assign({}, all[dateKey] || {});
+              today[wIdx] = { at: Date.now(), dhaka: hhmm, slot: curSlot, chosen, catchUp: decision === "catch-up", runId: RUN_ID };
+              await jwrite("dashboardSettings/gate/runs", "PUT", { [dateKey]: today });   // keeps only today
+              await jwrite("dashboardSettings/gate", "PATCH", { lastRun: Date.now(), lastRunDhaka: `${dateKey} ${hhmm}`, lastRunWindow: wIdx });
+            } catch (e) { console.log("Run marker failed: " + e.message); }
+          }
+          process.exit(go ? 0 : 2);
+          GATE_EOF
+          node gate.mjs && echo "go=yes" >> "$GITHUB_OUTPUT" || echo "go=no" >> "$GITHUB_OUTPUT"
 
   automation:
     needs: gate
@@ -115,6 +160,47 @@ jobs:
           npm init -y
           npm install playwright
           npx playwright install chromium
+
+      - name: 🎬 Install ffmpeg (Telegram videos as MP4)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = "Stop"
+          $existing = Get-Command ffmpeg -ErrorAction SilentlyContinue
+          if ($existing) {
+            Write-Host "ffmpeg already on PATH: $($existing.Source)"
+            "FFMPEG_PATH=$($existing.Source)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            & $existing.Source -version | Select-Object -First 1
+            exit 0
+          }
+          if ($IsWindows) {
+            $dir = Join-Path $env:RUNNER_TEMP "ffmpeg"
+            New-Item -ItemType Directory -Force -Path $dir | Out-Null
+            $bin = $null
+            try {
+              $zip = Join-Path $dir "ffmpeg.zip"
+              Invoke-WebRequest -Uri "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip" -OutFile $zip -UseBasicParsing
+              Expand-Archive -Path $zip -DestinationPath $dir -Force
+              $exe = Get-ChildItem -Path $dir -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+              if (-not $exe) { throw "ffmpeg.exe missing in archive" }
+              $bin = $exe.DirectoryName
+              Write-Host "ffmpeg static build downloaded -> $bin"
+            } catch {
+              Write-Host "Static download failed ($($_.Exception.Message)) - falling back to chocolatey"
+              choco install ffmpeg -y --no-progress | Out-Null
+              $bin = "C:\ProgramData\chocolatey\bin"
+            }
+            $ff = Join-Path $bin "ffmpeg.exe"
+            $bin | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+            "FFMPEG_PATH=$ff" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            & $ff -version | Select-Object -First 1
+          } else {
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq ffmpeg
+            $ff = (Get-Command ffmpeg).Source
+            "FFMPEG_PATH=$ff" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            & $ff -version | Select-Object -First 1
+          }
 
       - name: 🎲 Randomize Machine Identity
         shell: pwsh
@@ -352,9 +438,9 @@ jobs:
           const zedgePassword = process.env.ZEDGE_PASSWORD;
           const isHeadless = process.env.HEADLESS === "true";
 
-          const firebaseDatabaseURL = "https://shimul-zedge3-default-rtdb.firebaseio.com";
+          const firebaseDatabaseURL = "https://shimul-zedge3-default-rtdb.firebaseio.com"; // <-- CONFIG: your Firebase Realtime Database URL for account 3
           const queuePath = "wallpaperQueue";
-          const r2WorkerUrl = "https://white-flower-a665zedge-r2-gateway.shawonbarba1.workers.dev"; // Update to your Cloudflare Worker URL
+          const r2WorkerUrl = "https://shimul.shawonhawladar.workers.dev"; // <-- CONFIG: your Cloudflare R2 worker URL
 
           if (!zedgeEmail) throw new Error("Zedge email is required");
           if (!zedgePassword) throw new Error("Zedge password is required");
@@ -403,6 +489,7 @@ jobs:
           async function sendTelegramNotification(message) {
             const token = "8645885539:AAHhBHZdurvvipIjpgsuvOjfQv4EMtUdsrY";
             const chatId = "1946031792";
+            if (!token || !chatId) { console.log("Telegram not configured (token / chatId blank in this yml) - skipping notification."); return; }
             try {
               const url = `https://api.telegram.org/bot${token}/sendMessage`;
               const res = await fetch(url, {
@@ -454,6 +541,8 @@ jobs:
           //   3) give up -> send the .webm as before
           function findFfmpeg() {
             const { execSync } = require("child_process");
+            // 1) full ffmpeg installed by the "Install ffmpeg" workflow step (has libx264)
+            if (process.env.FFMPEG_PATH && fs.existsSync(process.env.FFMPEG_PATH)) return process.env.FFMPEG_PATH;
             try {
               execSync(process.platform === "win32" ? "where ffmpeg" : "which ffmpeg", { stdio: "ignore" });
               return "ffmpeg";
@@ -489,9 +578,20 @@ jobs:
                 execFileSync(ff, ["-y", "-loglevel", "error", "-i", webmPath,
                   "-c:v", "libx264", "-preset", "veryfast", "-crf", String(crf), "-pix_fmt", "yuv420p",
                   "-vf", vf, "-r", "25", "-movflags", "+faststart", "-an", mp4Path],
-                  { stdio: "ignore", timeout: 10 * 60 * 1000 });
+                  { stdio: ["ignore", "ignore", "pipe"], timeout: 10 * 60 * 1000 });
               };
-              encode(26, null);
+              console.log(`🎬 Converting video with ffmpeg: ${ff}`);
+              try {
+                encode(26, null);
+              } catch (e1) {
+                // ffmpeg without libx264 (e.g. Playwright's bundled build) - retry with the built-in mpeg4 encoder
+                const err1 = (e1.stderr ? e1.stderr.toString() : e1.message).trim().split("\n").slice(-3).join(" | ");
+                console.log(`⚠️ libx264 encode failed (${err1}) - retrying with mpeg4 encoder`);
+                execFileSync(ff, ["-y", "-loglevel", "error", "-i", webmPath, "-c:v", "mpeg4", "-q:v", "4", "-pix_fmt", "yuv420p",
+                  "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", "-r", "25", "-movflags", "+faststart", "-an", mp4Path],
+                  { stdio: ["ignore", "ignore", "pipe"], timeout: 10 * 60 * 1000 });
+              }
+              if (!fs.existsSync(mp4Path) || fs.statSync(mp4Path).size === 0) throw new Error("mp4 output missing/empty");
               const TG_LIMIT = 49 * 1024 * 1024; // Bot API upload cap is 50 MB
               if (fs.statSync(mp4Path).size > TG_LIMIT) {
                 console.log("📹 mp4 > 49MB - re-encoding smaller (720p, crf 32)");
@@ -500,7 +600,8 @@ jobs:
               console.log(`🎬 Video converted: ${path.basename(webmPath)} (${fmtBytes(fs.statSync(webmPath).size)}) -> ${path.basename(mp4Path)} (${fmtBytes(fs.statSync(mp4Path).size)})`);
               return mp4Path;
             } catch (e) {
-              console.log(`⚠️ Video conversion failed (${e.message}) - sending .webm as-is`);
+              const detail = e.stderr ? e.stderr.toString().trim().split("\n").slice(-3).join(" | ") : e.message;
+              console.log(`⚠️ Video conversion failed (${detail}) - sending .webm as-is`);
               return webmPath;
             }
           }
@@ -508,6 +609,7 @@ jobs:
           async function sendTelegramAttachment(filePath, type = "image", caption = "", extra = {}) {
             const token = "8645885539:AAHhBHZdurvvipIjpgsuvOjfQv4EMtUdsrY";
             const chatId = "1946031792";
+            if (!token || !chatId) { console.log("Telegram not configured - skipping attachment."); return; }
             try {
               if (!fs.existsSync(filePath)) {
                 console.log(`Telegram attachment file not found: ${filePath}`);
@@ -558,9 +660,9 @@ jobs:
               else if (dhakaHour >= 12 && dhakaHour < 17) greetingTime = "শুভ দুপুর";
               else if (dhakaHour >= 17 && dhakaHour < 22) greetingTime = "শুভ সন্ধ্যা";
               else greetingTime = "শুভ রাত্রি";
-              return `হ্যালো shimul ভাই, ${greetingTime}`;
+              return `হ্যালো শাওন ভাই, ${greetingTime}`;
             } catch (_) {
-              return "হ্যালো shimul ভাই";
+              return "হ্যালো শাওন ভাই";
             }
           }
 
@@ -1857,7 +1959,9 @@ jobs:
             let context = null;
 
             // Profile count is set via the workflow "total_profiles" input (default: 3)
-            const TOTAL_PROFILES = parseInt(process.env.TOTAL_PROFILES || "3", 10);
+            let TOTAL_PROFILES = parseInt(process.env.TOTAL_PROFILES || "3", 10);
+            if (!Number.isFinite(TOTAL_PROFILES) || TOTAL_PROFILES < 1) TOTAL_PROFILES = 1;
+            let profileCountWarned = false; // Telegram warning sent once per run
 
             try {
               // 1. Check Limits & figure out how many uploads we can still do today
@@ -1868,7 +1972,7 @@ jobs:
               const UPLOADS_PER_RUN = 1;
               const remainingUploads = Math.min(UPLOADS_PER_RUN, ZEDGE_DAILY_LIMIT - profileStateData.state.totalUploadsToday);
               let currentProfileIndex = profileStateData.nextProfileIndex;
-              const perProfileLimit   = profileStateData.perProfileLimit;
+              let perProfileLimit     = profileStateData.perProfileLimit;
               let currentState = profileStateData.state;
 
               console.log(`✅ Approved. Starting at profile index: ${currentProfileIndex}. Can do ${remainingUploads} upload(s) this run.`);
@@ -2407,9 +2511,48 @@ jobs:
                     "Profiles"
                   );
 
+                  // ── Profile-count guard ───────────────────────────────────────────
+                  // Count how many profile cards REALLY exist on this account and never
+                  // click an index that does not exist (e.g. total_profiles=3 but the
+                  // account only has 1 profile -> nth(1) timeout).
+                  const profileCards = page.locator('[data-hook="profile-list"] > div');
+                  try { await profileCards.first().waitFor({ state: "visible", timeout: 30000 }); } catch (_) {}
+                  const actualProfiles = await profileCards.count();
+                  console.log(`Profiles on account: ${actualProfiles} | configured total_profiles: ${TOTAL_PROFILES}`);
+                  if (actualProfiles === 0) {
+                    throw new Error("No profile found on the Zedge Profiles page ([data-hook=\"profile-list\"] is empty). Create/approve a profile first.");
+                  }
+                  if (actualProfiles < TOTAL_PROFILES) {
+                    const configured = TOTAL_PROFILES;
+                    TOTAL_PROFILES = actualProfiles;
+                    perProfileLimit = Math.ceil(ZEDGE_DAILY_LIMIT / TOTAL_PROFILES);
+                    console.warn(`⚠️ total_profiles=${configured} but only ${actualProfiles} profile(s) exist. Using ${actualProfiles}; per-profile limit is now ${perProfileLimit}.`);
+                    if (currentProfileIndex >= TOTAL_PROFILES) {
+                      const fixedIdx = getNextAvailableProfile(TOTAL_PROFILES - 1, currentState.profileUploadCounts, TOTAL_PROFILES, perProfileLimit);
+                      currentProfileIndex = fixedIdx === -1 ? 0 : fixedIdx;
+                      console.warn(`⚠️ Profile index adjusted to ${currentProfileIndex}`);
+                    }
+                    if (!profileCountWarned) {
+                      profileCountWarned = true;
+                      try {
+                        await sendTelegramNotification(tgCard(
+                          `⚠️ <b>প্রোফাইল সংখ্যা মিলছে না</b>`,
+                          [
+                            ["📁 প্রজেক্ট:", tgEscape(runLabel)],
+                            ["⚙️ total_profiles ইনপুট:", String(configured)],
+                            ["👤 অ্যাকাউন্টে আছে:", String(actualProfiles)],
+                            ["🕒 সময়:", fmtDhakaTime()]
+                          ],
+                          `✅ বট নিজে থেকে ${actualProfiles} টি প্রোফাইল ধরে চলছে।\n💡 পরের বার workflow চালানোর সময় <code>total_profiles = ${actualProfiles}</code> দিন।`
+                        ));
+                      } catch (_) {}
+                    }
+                  }
+                  // ─────────────────────────────────────────────────────────────────
+
                   // Click the correct rotated profile
                   await safeClick(
-                    page.locator('[data-hook="profile-list"] > div').nth(currentProfileIndex),
+                    profileCards.nth(currentProfileIndex),
                     `Profile Index ${currentProfileIndex}`
                   );
 
